@@ -16,12 +16,15 @@
  *   preview-btn       — the preview play button inside the popover
  */
 
+import { useTranslation } from 'react-i18next';
 import { useState } from 'react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Slider } from '@/components/ui/slider';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils/cn';
+import { apiClient } from '@/lib/api/client';
+import { toast } from '@/components/ui/use-toast';
 import { useUpdateSegment, usePreviewSegment } from '@/lib/hooks/useBooks';
 
 // ─── Shared emotion vocabulary (matches backend controlled vocabulary) ─────────
@@ -61,6 +64,8 @@ export function SegmentDeliveryControl({
   emotionIntensity: initialIntensity,
   delivery: initialDelivery = '',
 }: SegmentDeliveryControlProps) {
+  const { t } = useTranslation();
+  const [previewAudioSrc, setPreviewAudioSrc] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [localEmotion, setLocalEmotion] = useState(initialEmotion);
   const [localIntensity, setLocalIntensity] = useState(initialIntensity);
@@ -136,6 +141,9 @@ export function SegmentDeliveryControl({
       data: {
         emotion: localEmotion,
       },
+    }, {
+      onSuccess: (result) => setPreviewAudioSrc(apiClient.getBookAudioUrl(result.generation_id)),
+      onError: (error) => toast({ title: t('books.chapterEditor.previewFailed'), description: error.message, variant: 'destructive' }),
     });
   }
 
@@ -145,9 +153,9 @@ export function SegmentDeliveryControl({
         <span
           data-testid={`emotion-${segmentId}`}
           className="ml-1 cursor-pointer rounded px-1.5 py-0.5 text-xs text-muted-foreground hover:bg-muted"
-          title="Delivery / tone for this line (not the voice)"
+          title={t('books.chapterEditor.deliveryTitle')}
         >
-          {localEmotion} ▾
+          {t(`books.chapterEditor.emotions.${localEmotion}`, { defaultValue: localEmotion })} ▾
         </span>
       </PopoverTrigger>
       <PopoverContent
@@ -158,14 +166,14 @@ export function SegmentDeliveryControl({
       >
         {/* Header */}
         <p className="mb-2 text-xs font-medium text-muted-foreground">
-          Delivery / tone for this line (not the voice)
+          {t('books.chapterEditor.deliveryTitle')}
         </p>
 
         {/* Emotion preset buttons */}
         <div className="mb-3 flex flex-wrap gap-1">
           {EMOTION_PRESETS.map((preset) => (
             <button
-              key={preset}
+              key={t(`books.chapterEditor.emotions.${preset}`)}
               onClick={() => handleEmotionSelect(preset)}
               className={cn(
                 'rounded px-2 py-0.5 text-xs capitalize transition-colors',
@@ -174,7 +182,7 @@ export function SegmentDeliveryControl({
                   : 'bg-muted text-muted-foreground hover:bg-muted/80',
               )}
             >
-              {preset}
+              {t(`books.chapterEditor.emotions.${preset}`)}
             </button>
           ))}
         </div>
@@ -182,7 +190,7 @@ export function SegmentDeliveryControl({
         {/* Intensity slider */}
         <div className="mb-3">
           <label className="mb-1 block text-xs text-muted-foreground">
-            Intensity: {Math.round(localIntensity * 100)}%
+            {t('books.chapterEditor.intensity', { value: Math.round(localIntensity * 100) })}
           </label>
           <Slider
             min={0}
@@ -197,13 +205,13 @@ export function SegmentDeliveryControl({
         {/* Free-text delivery instruction */}
         <div className="mb-3">
           <label className="mb-1 block text-xs text-muted-foreground">
-            Instruction (optional)
+            {t('books.chapterEditor.instruction')}
           </label>
           <Input
             value={localDelivery}
             onChange={(e) => handleDeliveryChange(e.target.value)}
             onBlur={handleDeliveryBlur}
-            placeholder="e.g. speak with a trembling voice"
+            placeholder={t('books.chapterEditor.instructionPlaceholder')}
             className="text-xs"
           />
         </div>
@@ -217,8 +225,9 @@ export function SegmentDeliveryControl({
           disabled={isPreviewing}
           className="w-full"
         >
-          {isPreviewing ? 'Previewing…' : '▶ Preview this line'}
+          {t(isPreviewing ? 'books.chapterEditor.previewing' : 'books.chapterEditor.previewLine')}
         </Button>
+        {previewAudioSrc && <audio controls autoPlay src={previewAudioSrc} aria-label={t('books.chapterEditor.previewAudio')} className="mt-2 w-full" />}
       </PopoverContent>
     </Popover>
   );

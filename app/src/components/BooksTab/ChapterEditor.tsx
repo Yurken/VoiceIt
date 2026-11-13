@@ -17,7 +17,7 @@
  *   - Read-along: readalong-btn starts/stops; ChapterReadAlong highlights active seg [D5]
  */
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -30,6 +30,7 @@ import {
   useUpdateSegment,
   useSplitSegment,
   useMergeSegments,
+  usePreviewSegment,
 } from '@/lib/hooks/useBooks';
 import { SegmentDeliveryControl } from './SegmentDeliveryControl';
 import { SegmentRegenerateControl } from './SegmentRegenerateControl';
@@ -39,6 +40,7 @@ import { useBooksStore } from '@/stores/booksStore';
 import { useStoryStore } from '@/stores/storyStore';
 import { useStory } from '@/lib/hooks/useStories';
 import { useBook } from '@/lib/hooks/useBooks';
+import { apiClient } from '@/lib/api/client';
 import { useStoryPlayback } from '@/lib/hooks/useStoryPlayback';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -68,6 +70,32 @@ function hexToRgba(hex: string, alpha: number): string {
 /** Sort segments by order field */
 function sorted(segments: SegmentResponse[]): SegmentResponse[] {
   return [...segments].sort((a, b) => a.order - b.order);
+}
+
+const VOICE_STAGES = [
+  { value: '少年', key: 'youth' },
+  { value: '青年', key: 'youngAdult' },
+  { value: '中年', key: 'middleAged' },
+  { value: '老年', key: 'olderAdult' },
+] as const;
+
+/** Present legacy stage names using the same four broad choices as new books. */
+function normalizeVoiceStage(stage?: string | null): string {
+  const aliases: Record<string, string> = {
+    少年: '少年', 儿童: '少年', child: '少年', childhood: '少年', teen: '少年', teenager: '少年', youth: '少年',
+    青年: '青年', 成年: '青年', 成人: '青年', adult: '青年', young: '青年', 'young adult': '青年',
+    中年: '中年', 'middle-aged': '中年', middle_aged: '中年', 'middle aged': '中年',
+    老年: '老年', 老人: '老年', elderly: '老年', senior: '老年', 'older adult': '老年',
+  };
+  return aliases[stage?.trim().toLowerCase() ?? ''] ?? '';
+}
+
+/** Explicit server flags take precedence so a confirmed correction stays reviewed. */
+function segmentNeedsReview(segment: SegmentResponse, characters: CharacterResponse[]): boolean {
+  if (typeof segment.flagged === 'boolean') return segment.flagged;
+  const warnings = segment.analysis_metadata?.warnings;
+  const character = characters.find((item) => item.id === segment.character_id);
+  return (Array.isArray(warnings) && warnings.length > 0) || (segment.type === 'dialogue' && (character?.confidence ?? 1) < LOW_CONFIDENCE_THRESHOLD);
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -107,9 +135,10 @@ function ReassignDropdown({
   currentCharacterId,
   onReassign,
 }: ReassignDropdownProps) {
+  const { t } = useTranslation();
   return (
     <div data-testid="reassign-dropdown" className="w-52 p-2">
-      <p className="mb-1.5 text-xs text-muted-foreground">Reassign this line to…</p>
+      <p className="mb-1.5 text-xs text-muted-foreground">{t('books.chapterEditor.reassignTitle')}</p>
       <ul>
         {characters.map((char) => (
           <li key={char.id}>
@@ -172,6 +201,8 @@ function SelectionDialog({
   );
   const [editMode, setEditMode] = useState(false);
   const [editText, setEditText] = useState(segment.text);
+  const originalVoiceStage = normalizeVoiceStage(segment.voice_stage);
+  const [voiceStage, setVoiceStage] = useState(originalVoiceStage);
   const [error, setError] = useState<string | null>(null);
   const [splitting, setSplitting] = useState(false);
 
@@ -285,7 +316,7 @@ function SelectionDialog({
       updateMutate(
         {
           segmentId: segment.id,
-          data: { text: editText },
+          data: { text: editText, voice_stage: voiceStage.trim() || null },
           bookId,
           chapterId,
         },
@@ -295,7 +326,8 @@ function SelectionDialog({
       );
     } else {
       // Type toggle and/or speaker change
-      const updateData: Record<string, string> = {};
+      const updateData: Record<string, string | null> = {};
+      if (voiceStage !== originalVoiceStage) updateData.voice_stage = voiceStage || null;
       if (localType !== segment.type) updateData.type = localType;
       if (isDialogue && localCharacterId !== segment.character_id) {
         updateData.character_id = localCharacterId;
@@ -369,10 +401,19 @@ function SelectionDialog({
         </div>
       )}
 
+      <div className="mb-3">
+        <label className="mb-1 block text-xs text-muted-foreground" htmlFor={`voice-stage-${segment.id}`}>{t('books.chapterEditor.voiceStage')}</label>
+        <select id={`voice-stage-${segment.id}`} data-testid="voice-stage-input" className="w-full rounded border bg-background px-2 py-1 text-sm" value={voiceStage} onChange={(event) => setVoiceStage(event.target.value)}>
+          <option value="">{t('books.chapterEditor.voiceStageUnchanged')}</option>
+          {VOICE_STAGES.map((stage) => <option key={stage.value} value={stage.value}>{t(`books.chapterEditor.voiceStages.${stage.key}`)}</option>)}
+        </select>
+        <p className="mt-1 text-xs text-muted-foreground">{t('books.chapterEditor.voiceStageHint')}</p>
+      </div>
+
       {/* Per-line regenerate — D3 */}
       {segment.audio?.status && segment.audio.status !== 'none' && (
         <div className="mb-3">
-          <p className="mb-1 text-xs text-muted-foreground">Audio</p>
+          <p className="mb-1 text-xs text-muted-foreground">{t('books.chapterEditor.audio')}</p>
           <SegmentRegenerateControl
             segmentId={segment.id}
             bookId={bookId}
@@ -525,9 +566,12 @@ function SegmentLine({
     onSelect(null);
   }
 
+  const voiceStage = VOICE_STAGES.find((stage) => stage.value === normalizeVoiceStage(segment.voice_stage));
+
   // The ⋯ menu button + selection dialog wrapper (shared by narration and dialogue)
   const menuAndDialog = (
     <span className="relative inline-block">
+      {voiceStage && <span className="ml-1 rounded bg-muted px-1 text-xs text-muted-foreground" title={t('books.chapterEditor.voiceStage')}>{t(`books.chapterEditor.voiceStages.${voiceStage.key}`)}</span>}
       <button
         aria-label={t('books.chapterEditor.lineMenuBtn')}
         className="ml-1 rounded px-1 text-xs text-muted-foreground opacity-50 hover:opacity-100"
@@ -646,18 +690,16 @@ interface ReviewRailProps {
   segments: SegmentResponse[];
   characters: CharacterResponse[];
   onJump: (id: string) => void;
+  onReviewed: (id: string) => void;
 }
 
-function ReviewRail({ segments, characters, onJump }: ReviewRailProps) {
+function ReviewRail({ segments, characters, onJump, onReviewed }: ReviewRailProps) {
   const { t } = useTranslation();
 
-  const dialogueSegments = segments.filter((s) => s.type === 'dialogue');
-  const flagged = dialogueSegments
-    .filter((s) => {
-      const char = characters.find((c) => c.id === s.character_id);
-      const confidence = char?.confidence ?? 1;
-      return confidence < LOW_CONFIDENCE_THRESHOLD;
-    })
+  const preview = usePreviewSegment();
+  const [previewAudioSrc, setPreviewAudioSrc] = useState<string | null>(null);
+  const pendingReview = segments.filter((segment) => segmentNeedsReview(segment, characters));
+  const flagged = pendingReview
     .sort((a, b) => {
       const ca = characters.find((c) => c.id === a.character_id)?.confidence ?? 1;
       const cb = characters.find((c) => c.id === b.character_id)?.confidence ?? 1;
@@ -687,7 +729,7 @@ function ReviewRail({ segments, characters, onJump }: ReviewRailProps) {
                   ? t('books.chapterEditor.lineGuessed', { order: seg.order, name: char.name })
                   : t('books.chapterEditor.lineUnattributed', { order: seg.order })}{' '}
                 <Badge variant="destructive" className="text-xs">
-                  {t('books.chapterEditor.confidenceLow')}
+                  {t('books.chapterEditor.reviewTitle')}
                 </Badge>
               </div>
               <div className="mb-1.5 text-sm">{seg.text}</div>
@@ -697,15 +739,14 @@ function ReviewRail({ segments, characters, onJump }: ReviewRailProps) {
                   size="sm"
                   data-testid={`jump-${seg.id}`}
                   onClick={() => onJump(seg.id)}
-                  title="scroll to this line in the text and select it"
+                  title={t('books.chapterEditor.reviewJump')}
                 >
                   {t('books.chapterEditor.reviewJump')} ↪
                 </Button>
-                {/* INERT slot — D3 wires per-line audio preview */}
-                <Button variant="ghost" size="sm" disabled title="play just this line — wired by D3">
+                <Button variant="ghost" size="sm" disabled={preview.isPending} onClick={() => preview.mutate({ segmentId: seg.id }, { onSuccess: (result) => setPreviewAudioSrc(apiClient.getBookAudioUrl(result.generation_id)), onError: (error) => toast({ title: t('books.chapterEditor.previewFailed'), description: error.message, variant: 'destructive' }) })} title={t('books.chapterEditor.reviewHear')}>
                   ▶ {t('books.chapterEditor.reviewHear')}
                 </Button>
-                <Button variant="ghost" size="sm" title="mark this line as reviewed — wired by C15">
+                <Button variant="ghost" size="sm" data-testid={`reviewed-${seg.id}`} onClick={() => onReviewed(seg.id)} title={t('books.chapterEditor.reviewReviewed')}>
                   ✓ {t('books.chapterEditor.reviewReviewed')}
                 </Button>
               </div>
@@ -713,15 +754,13 @@ function ReviewRail({ segments, characters, onJump }: ReviewRailProps) {
           );
         })}
         {flagged.length === 0 && (
-          <p className="text-xs text-muted-foreground">No low-confidence lines to review.</p>
+          <p className="text-xs text-muted-foreground">{t('books.chapterEditor.noFlagged')}</p>
         )}
       </div>
 
+      {previewAudioSrc && <audio controls autoPlay src={previewAudioSrc} aria-label={t('books.chapterEditor.previewAudio')} className="w-full" />}
       <p className="mt-auto text-xs text-muted-foreground" data-testid="review-progress">
-        {t('books.chapterEditor.reviewProgress', {
-          reviewed: 0,
-          total: dialogueSegments.length,
-        })}
+        {t('books.chapterEditor.reviewPending', { count: pendingReview.length })}
       </p>
     </section>
   );
@@ -747,6 +786,9 @@ export function ChapterEditor() {
     setReadAlong: s.setReadAlong,
   }));
 
+  const playbackChapterRequest = useBooksStore((s) => s.playbackChapterRequest);
+  const requestChapterPlayback = useBooksStore((s) => s.requestChapterPlayback);
+  const setSelectedChapterId = useBooksStore((s) => s.setSelectedChapterId);
   const { data: characters = [] } = useCharacters(selectedBookId);
   const { data: rawSegments = [] } = useSegments(selectedBookId, selectedChapterId);
   const { mutate: updateMutate } = useUpdateSegment();
@@ -820,6 +862,23 @@ export function ChapterEditor() {
     storyPlay(chapterStoryId, sortedItems);
   }
 
+  useEffect(() => {
+    if (playbackChapterRequest !== selectedChapterId || !chapterStoryId || !chapterStory?.items?.length) return;
+    setReadAlong(true);
+    storyPlay(chapterStoryId, [...chapterStory.items].sort((a, b) => a.start_time_ms - b.start_time_ms));
+    requestChapterPlayback(null);
+  }, [playbackChapterRequest, selectedChapterId, chapterStoryId, chapterStory, setReadAlong, storyPlay, requestChapterPlayback]);
+
+  const chapterIndex = bookDetail?.chapters.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
+  function switchChapter(offset: number) {
+    const chapter = bookDetail?.chapters[chapterIndex + offset];
+    if (!chapter) return;
+    storyPause();
+    setReadAlong(false);
+    setSelectedChapterId(chapter.id);
+    setSelectedSegmentId(null);
+  }
+
   // ── Client-side filtering ────────────────────────────────────────────────
   const visibleSegments = segments.filter((seg) => {
     if (filterMode === 'dialogue') return seg.type === 'dialogue';
@@ -828,8 +887,7 @@ export function ChapterEditor() {
       return seg.character_id === byCharacterId;
     }
     if (filterMode === 'flagged') {
-      const char = characters.find((c) => c.id === seg.character_id);
-      return (char?.confidence ?? 1) < LOW_CONFIDENCE_THRESHOLD;
+      return segmentNeedsReview(seg, characters);
     }
     return true;
   });
@@ -867,11 +925,11 @@ export function ChapterEditor() {
         </div>
         {/* INERT slot — chapter-switcher prev/next wired by C15 */}
         <div className="flex items-center gap-2" data-testid="chapter-switcher">
-          <Button variant="ghost" size="sm" disabled title="previous chapter — wired by C15">
+          <Button variant="ghost" size="sm" disabled={chapterIndex <= 0} title={t('books.chapterEditor.previousChapter')} onClick={() => switchChapter(-1)}>
             ◀
           </Button>
-          <span className="font-semibold">Chapter</span>
-          <Button variant="ghost" size="sm" disabled title="next chapter — wired by C15">
+          <span className="font-semibold">{t('books.chapterEditor.chapter', { number: chapterMeta?.number ?? chapterIndex + 1 })}</span>
+          <Button variant="ghost" size="sm" disabled={chapterIndex < 0 || chapterIndex >= (bookDetail?.chapters.length ?? 0) - 1} title={t('books.chapterEditor.nextChapter')} onClick={() => switchChapter(1)}>
             ▶
           </Button>
         </div>
@@ -1030,7 +1088,6 @@ export function ChapterEditor() {
                 </header>
               )}
               {visibleSegments.map((seg) => {
-                const isDialogue = seg.type === 'dialogue';
                 // Find prev/next segments in the full sorted list for merge operations
                 const fullIdx = segments.findIndex((s) => s.id === seg.id);
                 const prevSeg = fullIdx > 0 ? segments[fullIdx - 1] : null;
@@ -1054,15 +1111,6 @@ export function ChapterEditor() {
                       splitMutateAsync={splitMutateAsync}
                       mergeMutate={mergeMutate}
                     />
-                    {/* Per-line hover preview (D3 wires ▶ audition) */}
-                    {isDialogue && (
-                      <span
-                        className="ml-1 cursor-pointer opacity-0 hover:opacity-100"
-                        title="Audition this line — wired by D3"
-                      >
-                        ♪
-                      </span>
-                    )}
                   </p>
                 );
               })}
@@ -1075,6 +1123,7 @@ export function ChapterEditor() {
           segments={segments}
           characters={characters}
           onJump={handleJump}
+          onReviewed={(segmentId) => updateMutate({ segmentId, bookId: selectedBookId ?? '', chapterId: selectedChapterId ?? '', data: { flagged: false } })}
         />
       </div>
 

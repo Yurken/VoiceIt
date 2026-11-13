@@ -111,6 +111,13 @@ def build_server(cuda=False):
             "--hidden-import",
             "backend.backends.qwen_custom_voice_backend",
             "--hidden-import",
+            "backend.backends.breeze_backend",
+            # The isolated MLX runtime executes this standalone source script.
+            "--add-data",
+            f"backends/breeze_worker.py{os.pathsep}backend/backends",
+            "--add-data",
+            f"data/breezeblue_voice_prompts.csv{os.pathsep}backend/data",
+            "--hidden-import",
             "backend.utils.audio",
             "--hidden-import",
             "backend.utils.cache",

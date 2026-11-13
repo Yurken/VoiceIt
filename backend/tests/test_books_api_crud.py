@@ -45,7 +45,7 @@ def _make_app(tmp_path, monkeypatch, include_analysis: bool = False):
         # Mock enqueue_analysis so the test doesn't start a real pipeline
         import backend.services.book_analysis as ba_svc
 
-        def mock_enqueue(book_id, model_size, narrator_voice_id):
+        def mock_enqueue(book_id, model_size, narrator_voice_id, **options):
             db = TestSession()
             try:
                 book = db.query(Book).filter_by(id=book_id).first()

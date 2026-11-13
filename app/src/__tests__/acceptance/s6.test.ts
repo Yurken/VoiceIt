@@ -260,7 +260,7 @@ describe('S6: Generate audio for a chapter', () => {
       expect(noneBadges).toHaveLength(2);
       // No play affordance is offered yet — audio doesn't exist.
       expect(
-        within(chapterList).queryByLabelText('play-chapter-1'),
+        within(chapterList).queryByTestId('play-chapter-1'),
       ).not.toBeInTheDocument();
 
       // ── User action: click "Generate" on chapter 1.
@@ -359,13 +359,13 @@ describe('S6: Generate audio for a chapter', () => {
       //    user can listen to the generated audio. This is the concrete
       //    "audio appears" half of S6.
       expect(
-        within(chapterList).getByLabelText('play-chapter-1'),
+        within(chapterList).getByTestId('play-chapter-1'),
       ).toBeInTheDocument();
 
       // ── Observable C: the unrelated chapter has neither badge nor play
       //    affordance — completion was scoped to the clicked row.
       expect(
-        within(chapterList).queryByLabelText('play-chapter-2'),
+        within(chapterList).queryByTestId('play-chapter-2'),
       ).not.toBeInTheDocument();
     },
     20_000,
@@ -431,7 +431,7 @@ describe('S6: Generate audio for a chapter', () => {
       });
       await waitFor(() => {
         expect(
-          within(chapterList).getByLabelText('play-chapter-1'),
+          within(chapterList).getByTestId('play-chapter-1'),
         ).toBeInTheDocument();
       });
 
@@ -448,7 +448,7 @@ describe('S6: Generate audio for a chapter', () => {
       });
       await waitFor(() => {
         expect(
-          within(chapterList).getByLabelText('play-chapter-2'),
+          within(chapterList).getByTestId('play-chapter-2'),
         ).toBeInTheDocument();
       });
 
@@ -464,10 +464,10 @@ describe('S6: Generate audio for a chapter', () => {
       // ── Final observable: both chapters are playable — the book as a
       //    whole now has audio for every chapter.
       expect(
-        within(chapterList).getByLabelText('play-chapter-1'),
+        within(chapterList).getByTestId('play-chapter-1'),
       ).toBeInTheDocument();
       expect(
-        within(chapterList).getByLabelText('play-chapter-2'),
+        within(chapterList).getByTestId('play-chapter-2'),
       ).toBeInTheDocument();
       // No chapter is still showing the baseline `none` badge — every row
       // has advanced past the pre-generation state.

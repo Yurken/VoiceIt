@@ -10,6 +10,8 @@ Publishes export_progress / export_complete events on the per-book SSE channel.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -27,6 +29,26 @@ logger = logging.getLogger(__name__)
 _export_cache: dict[str, dict[str, str]] = {}
 
 
+def get_export_entry(book_id: str) -> dict[str, str] | None:
+    """Recover a completed export after a server restart."""
+    if book_id in _export_cache:
+        entry = _export_cache[book_id]
+        if Path(entry["path"]).is_file():
+            return entry
+        _export_cache.pop(book_id, None)
+    directory = get_data_dir() / "exports" / book_id
+    try:
+        entry = json.loads((directory / "export.json").read_text(encoding="utf-8"))
+        path = (directory / entry["filename"]).resolve()
+        if not path.is_relative_to(directory.resolve()) or not path.is_file():
+            return None
+        result = {"path": str(path), "filename": path.name}
+        _export_cache[book_id] = result
+        return result
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -34,7 +56,7 @@ _export_cache: dict[str, dict[str, str]] = {}
 
 def _has_any_audio(book_id: str, db: Session) -> bool:
     """Return True if the book has at least one segment with audio_status='completed'."""
-    from ..database import Book, BookSegment, Chapter
+    from ..database import BookSegment, Chapter
 
     completed = (
         db.query(BookSegment)
@@ -137,11 +159,20 @@ async def run_export_task(
     """
     from ..database import Book
 
+    loop = asyncio.get_running_loop()
+
     def _pub(payload: dict) -> None:
-        book_events.publish(book_id, payload)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            book_events.publish(book_id, payload)
+        else:
+            loop.call_soon_threadsafe(book_events.publish, book_id, payload)
 
     try:
-        _pub({"type": "export_progress", "progress": 0, "message": "Starting export"})
+        _pub({"type": "export_progress", "progress": 0, "message": "正在准备导出"})
 
         # Collect chapter audio paths
         chapters = _collect_chapters(book_id, db)
@@ -158,7 +189,8 @@ async def run_export_task(
         # Set export output directory under data dir / exports / book_id
         output_dir = str(get_data_dir() / "exports" / book_id)
 
-        out_path, filename = audiobook_export.export_book(
+        out_path, filename = await asyncio.to_thread(
+            audiobook_export.export_book,
             chapters=chapters,
             output_dir=output_dir,
             options=options,
@@ -167,6 +199,12 @@ async def run_export_task(
 
         # Cache the result for the download endpoint
         _export_cache[book_id] = {"path": out_path, "filename": filename}
+        if Path(out_path).is_file():
+            manifest = Path(output_dir) / "export.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            temporary = manifest.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps({"filename": Path(out_path).name}, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(manifest)
 
         # Flip book status back to ready
         book = db.query(Book).filter_by(id=book_id).first()

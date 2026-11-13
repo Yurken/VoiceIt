@@ -36,6 +36,7 @@ export function useBooks() {
   return useQuery({
     queryKey: bookKeys.list,
     queryFn: () => apiClient.listBooks(),
+    refetchInterval: (query) => query.state.data?.some((book) => ['analyzing', 'generating', 'exporting'].includes(book.status)) ? 3000 : false,
   });
 }
 
@@ -44,6 +45,7 @@ export function useBook(bookId: string | null) {
     queryKey: bookKeys.detail(bookId ?? ''),
     queryFn: () => apiClient.getBook(bookId!),
     enabled: !!bookId,
+    refetchInterval: (query) => ['analyzing', 'generating', 'exporting'].includes(query.state.data?.status ?? '') ? 2500 : false,
   });
 }
 
@@ -91,6 +93,7 @@ export function useBookGenerationStatus(bookId: string | null) {
     queryKey: bookKeys.generationStatus(bookId ?? ''),
     queryFn: () => apiClient.getGenerationStatus(bookId!),
     enabled: !!bookId,
+    refetchInterval: 2500,
   });
 }
 
@@ -105,7 +108,7 @@ export function useImportBook() {
       opts,
     }: {
       file: File;
-      opts?: { model_size?: string; narrator_voice_id?: string };
+      opts?: { model_size?: string; narrator_voice_id?: string; voice_mode?: 'preset' | 'designed' };
     }) => apiClient.importBook(file, opts),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: bookKeys.list });
@@ -146,12 +149,15 @@ export function useAnalyzeBook() {
       opts,
     }: {
       bookId: string;
-      opts?: { model_size?: string; narrator_voice_id?: string };
+      opts?: { model_size?: string; narrator_voice_id?: string; voice_mode?: 'preset' | 'designed' };
     }) => apiClient.analyzeBook(bookId, opts),
     onSuccess: (_, variables) => {
       // Narrowly invalidate book detail + characters (analysis changes both)
       queryClient.invalidateQueries({ queryKey: bookKeys.detail(variables.bookId) });
       queryClient.invalidateQueries({ queryKey: bookKeys.characters(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.voiceOptions(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: ['books', variables.bookId, 'chapters'], exact: false });
+      queryClient.invalidateQueries({ queryKey: bookKeys.generationStatus(variables.bookId) });
     },
   });
 }
@@ -173,6 +179,7 @@ export function useUpdateCharacter() {
     }) => apiClient.updateCharacter(bookId, charId, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: bookKeys.characters(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.voiceOptions(variables.bookId) });
     },
   });
 }
@@ -193,6 +200,7 @@ export function useMergeCharacter() {
     onSuccess: (_, variables) => {
       // Merge affects characters + all segments (character assignment changes)
       queryClient.invalidateQueries({ queryKey: bookKeys.characters(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.voiceOptions(variables.bookId) });
       queryClient.invalidateQueries({
         queryKey: ['books', variables.bookId, 'chapters'],
         exact: false,
@@ -217,6 +225,7 @@ export function useSplitCharacter() {
     onSuccess: (_, variables) => {
       // Split affects characters + segments
       queryClient.invalidateQueries({ queryKey: bookKeys.characters(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.voiceOptions(variables.bookId) });
       queryClient.invalidateQueries({
         queryKey: ['books', variables.bookId, 'chapters'],
         exact: false,
@@ -233,6 +242,7 @@ export function useDeleteCharacter() {
       apiClient.deleteCharacter(bookId, charId),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: bookKeys.characters(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.voiceOptions(variables.bookId) });
       // Delete reassigns segments to narrator — invalidate all chapter segments
       queryClient.invalidateQueries({
         queryKey: ['books', variables.bookId, 'chapters'],
@@ -303,6 +313,7 @@ export function useSplitSegment() {
     onSuccess: (_, variables) => {
       // Split affects characters (possibly) + affected segments
       queryClient.invalidateQueries({ queryKey: bookKeys.characters(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.voiceOptions(variables.bookId) });
       queryClient.invalidateQueries({
         queryKey: bookKeys.segments(variables.bookId, variables.chapterId),
       });
@@ -326,6 +337,7 @@ export function useMergeSegments() {
     onSuccess: (_, variables) => {
       // Merge affects characters + segments
       queryClient.invalidateQueries({ queryKey: bookKeys.characters(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.voiceOptions(variables.bookId) });
       queryClient.invalidateQueries({
         queryKey: bookKeys.segments(variables.bookId, variables.chapterId),
       });
@@ -393,6 +405,7 @@ export function useGenerateChapter() {
       data?: GenerateChapterRequest;
     }) => apiClient.generateChapter(bookId, chapterId, data),
     onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: bookKeys.detail(variables.bookId) });
       queryClient.invalidateQueries({
         queryKey: bookKeys.generationStatus(variables.bookId),
       });
@@ -407,6 +420,7 @@ export function useGenerateBook() {
     mutationFn: ({ bookId, data }: { bookId: string; data?: GenerateBookRequest }) =>
       apiClient.generateBook(bookId, data),
     onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: bookKeys.detail(variables.bookId) });
       queryClient.invalidateQueries({
         queryKey: bookKeys.generationStatus(variables.bookId),
       });
@@ -501,9 +515,14 @@ export function useCloneVoiceForCharacter() {
 // ─── Export mutations ─────────────────────────────────────────────────────────
 
 export function useStartExport() {
+  const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ bookId, data }: { bookId: string; data: ExportRequest }) =>
       apiClient.startExport(bookId, data),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: bookKeys.detail(variables.bookId) });
+      queryClient.invalidateQueries({ queryKey: bookKeys.list });
+    },
   });
 }
 
@@ -522,19 +541,21 @@ export function useDownloadExport() {
       bookId,
       bookTitle,
       format,
+      filename: exportFilename,
     }: {
       bookId: string;
       bookTitle: string;
       format: ExportFormat;
+      filename?: string;
     }) => {
       const blob = await apiClient.downloadExport(bookId);
 
       const safeName = bookTitle
         .substring(0, 50)
-        .replace(/[^a-z0-9]/gi, '-')
+        .replace(/[^\p{L}\p{N}._-]/gu, '-')
         .toLowerCase();
       const ext = FORMAT_EXT[format];
-      const filename = `${safeName || 'book'}${ext}`;
+      const filename = exportFilename?.split(/[\\/]/).pop() || `${safeName || 'book'}${ext}`;
 
       await platform.filesystem.saveFile(filename, blob, [
         {

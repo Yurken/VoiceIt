@@ -55,10 +55,10 @@ async def start_export(
     """
     book = _get_book_or_404(book_id, db)
 
-    if book.status == "generating":
+    if book.status in {"generating", "analyzing", "exporting"}:
         raise HTTPException(
             status_code=409,
-            detail="Book is currently generating audio; export is not allowed",
+            detail="这本书正在处理任务，请等待完成后再导出",
         )
 
     # Guard: at least one rendered segment must exist
@@ -105,7 +105,7 @@ async def download_export(
     """
     _get_book_or_404(book_id, db)
 
-    entry = book_export_api._export_cache.get(book_id)
+    entry = book_export_api.get_export_entry(book_id)
     if entry is None:
         raise HTTPException(
             status_code=404,

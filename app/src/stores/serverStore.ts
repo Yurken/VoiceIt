@@ -29,6 +29,13 @@ function invalidateAllServerData() {
 
 export function getDefaultServerUrl(): string {
   const fallback = 'http://127.0.0.1:17493';
+  const configuredUrl = import.meta.env.VITE_SERVER_URL;
+
+  if (configuredUrl) {
+    return typeof window === 'undefined'
+      ? configuredUrl
+      : new URL(configuredUrl, window.location.origin).href.replace(/\/$/, '');
+  }
 
   if (!import.meta.env.PROD || typeof window === 'undefined') {
     return fallback;

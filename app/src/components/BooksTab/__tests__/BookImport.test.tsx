@@ -497,7 +497,7 @@ describe('BookImport — analysis options', () => {
     expect(analyzePayloads).toEqual([
       {
         bookId: 'b1',
-        opts: { model_size: '1.7B', narrator_voice_id: 'auto' },
+        opts: { model_size: '1.7B', narrator_voice_id: 'auto', voice_mode: 'preset' },
       },
     ]);
     // Observable downstream outcome: the analyze mock's synchronous
@@ -505,5 +505,35 @@ describe('BookImport — analysis options', () => {
     // confirming the payload propagated through the success path.
     expect(useBooksStore.getState().view).toBe('analysis');
     expect(useBooksStore.getState().selectedBookId).toBe('b1');
+  });
+});
+
+
+describe('BookImport — automatic analysis', () => {
+  beforeEach(() => {
+    vi.mocked(useImportBook).mockReturnValue({ mutate: mockImportMutate, data: undefined, isPending: false } as unknown as ReturnType<typeof useImportBook>);
+    vi.mocked(useAnalyzeBook).mockReturnValue({ mutate: mockAnalyzeMutate, isPending: false } as unknown as ReturnType<typeof useAnalyzeBook>);
+    mockImportMutate.mockImplementation((_variables, options) => options?.onSuccess?.(importedBook));
+  });
+
+  it('starts Qwen character analysis automatically after a successful upload', () => {
+    render(wrap(<BookImport />));
+    fireEvent.change(screen.getByTestId('book-dropzone'), { target: { files: [new File(['Novel'], 'novel.txt')] } });
+    expect(mockAnalyzeMutate.mock.calls.map(([payload]) => payload)).toEqual([{ bookId: 'b1', opts: { model_size: '1.7B', narrator_voice_id: 'auto', voice_mode: 'preset' } }]);
+    expect(useBooksStore.getState().view).toBe('analysis');
+  });
+
+  it('supports automatic BreezeBlue character casting when selected', () => {
+    render(wrap(<BookImport />));
+    fireEvent.change(screen.getByLabelText('Character voice source'), { target: { value: 'designed' } });
+    fireEvent.change(screen.getByTestId('book-dropzone'), { target: { files: [new File(['Novel'], 'novel.txt')] } });
+    expect(mockAnalyzeMutate.mock.calls[0][0]).toEqual({ bookId: 'b1', opts: { model_size: '1.7B', narrator_voice_id: 'auto', voice_mode: 'designed' } });
+  });
+
+  it('allows uploading for review without starting analysis', () => {
+    render(wrap(<BookImport />));
+    fireEvent.click(screen.getByRole('checkbox', { name: /Automatically analyze/ }));
+    fireEvent.change(screen.getByTestId('book-dropzone'), { target: { files: [new File(['Novel'], 'novel.txt')] } });
+    expect(mockAnalyzeMutate.mock.calls).toEqual([]);
   });
 });

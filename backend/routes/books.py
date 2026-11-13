@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Book CRUD and import endpoints (contract 01).
 
 Wires: POST /books/import, GET /books, GET /books/{id},
@@ -37,7 +38,7 @@ def _get_book_or_404(book_id: str, db: Session) -> database.Book:
     """Return a Book row or raise 404."""
     book = db.query(database.Book).filter_by(id=book_id).first()
     if book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=404, detail="未找到这本书")
     return book
 
 
@@ -67,16 +68,12 @@ def _book_to_response(book: database.Book, db: Session) -> models.BookResponse:
         chapter_count=_chapter_count(book.id, db),
         created_at=book.created_at,
         updated_at=book.updated_at,
+        **_export_fields(book.id),
     )
 
 
 def _book_to_detail(book: database.Book, db: Session) -> models.BookDetailResponse:
-    chapters = (
-        db.query(database.Chapter)
-        .filter_by(book_id=book.id)
-        .order_by(database.Chapter.number)
-        .all()
-    )
+    chapters = db.query(database.Chapter).filter_by(book_id=book.id).order_by(database.Chapter.number).all()
     chapter_summaries = [_chapter_to_summary(ch, db) for ch in chapters]
     return models.BookDetailResponse(
         id=book.id,
@@ -89,7 +86,19 @@ def _book_to_detail(book: database.Book, db: Session) -> models.BookDetailRespon
         created_at=book.created_at,
         updated_at=book.updated_at,
         chapters=chapter_summaries,
+        **_export_fields(book.id),
     )
+
+
+def _export_fields(book_id: str) -> dict:
+    from ..services.book_export_api import get_export_entry
+
+    entry = get_export_entry(book_id)
+    if not entry:
+        return {}
+    formats = {".m4b": "m4b", ".mp3": "mp3_single", ".zip": "mp3_per_chapter"}
+    extension = Path(entry["filename"]).suffix.lower()
+    return {"export_filename": entry["filename"], "export_format": formats.get(extension)}
 
 
 def _persist_parsed_book(
@@ -148,26 +157,43 @@ async def import_book(
     # Validate extension
     filename = file.filename or ""
     if "." not in filename:
-        raise HTTPException(status_code=400, detail="No file extension provided")
+        raise HTTPException(status_code=400, detail="请选择带有扩展名的小说文件")
     ext = filename.rsplit(".", 1)[-1].lower()
     if ext not in ALLOWED:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: .{ext}")
+        raise HTTPException(status_code=400, detail=f"暂不支持 .{ext}，请上传 TXT、EPUB、FB2 或 PDF")
 
-    # Read and size-check
-    data = await file.read()
-    if len(data) > MAX_BYTES:
-        raise HTTPException(status_code=400, detail="File exceeds 200 MB limit")
-
-    # Write to temp file, parse, clean up
-    suffix = f".{ext}"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+    # UploadFile already spools large uploads; copy it progressively instead
+    # of allocating another 200 MB byte string in the application.
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
         tmp_path = tmp.name
-        tmp.write(data)
-
+        total = 0
+        try:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_BYTES:
+                    raise HTTPException(status_code=400, detail="小说文件不能超过 200 MB")
+                tmp.write(chunk)
+        except BaseException:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
     try:
+        if not total:
+            raise HTTPException(status_code=400, detail="小说文件是空的，请选择包含正文的文件")
         parsed = ingestion.parse_book(tmp_path, ext)
+        # Temporary storage must never become the public book/chapter name.
+        temporary_title = Path(tmp_path).stem
+        original_title = Path(filename.replace("\\", "/")).stem
+        if parsed.title == temporary_title:
+            parsed.title = original_title
+        for chapter in parsed.chapters:
+            if chapter.title and temporary_title in chapter.title:
+                chapter.title = chapter.title.replace(temporary_title, original_title)
+        if not parsed.chapters or not any(ch.text.strip() for ch in parsed.chapters):
+            raise HTTPException(
+                status_code=400, detail="未提取到小说正文。扫描版 PDF 请先进行文字识别（OCR），或上传 TXT/EPUB。"
+            )
     except ingestion.IngestionError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -178,11 +204,7 @@ async def import_book(
 @router.get("", response_model=list[models.BookResponse])
 async def list_books(db: Session = Depends(get_db)) -> list[models.BookResponse]:
     """List all books, newest first."""
-    books = (
-        db.query(database.Book)
-        .order_by(database.Book.created_at.desc())
-        .all()
-    )
+    books = db.query(database.Book).order_by(database.Book.created_at.desc()).all()
     return [_book_to_response(b, db) for b in books]
 
 

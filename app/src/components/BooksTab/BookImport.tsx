@@ -29,6 +29,8 @@ export function BookImport() {
   const [extError, setExtError] = useState<string | null>(null);
   const [modelSize, setModelSize] = useState<string>('1.7B');
   const [narratorVoice, setNarratorVoice] = useState<string>('auto');
+  const [autoAnalyze, setAutoAnalyze] = useState(true);
+  const [voiceMode, setVoiceMode] = useState<'preset' | 'designed'>('preset');
 
   const setView = useBooksStore((s) => s.setView);
   const setSelectedBookId = useBooksStore((s) => s.setSelectedBookId);
@@ -46,7 +48,11 @@ export function BookImport() {
       return;
     }
     setExtError(null);
-    importMutation.mutate({ file });
+    importMutation.mutate({ file, opts: { model_size: modelSize, narrator_voice_id: narratorVoice, voice_mode: voiceMode } }, {
+      onSuccess: (imported) => {
+        if (autoAnalyze) startAnalysis(imported.id);
+      },
+    });
   }
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -74,17 +80,20 @@ export function BookImport() {
 
   // ── Analyze ───────────────────────────────────────────────────────────────
 
-  function handleAnalyze() {
-    if (!book) return;
+  function startAnalysis(bookId: string) {
     analyzeMutation.mutate(
-      { bookId: book.id, opts: { model_size: modelSize, narrator_voice_id: narratorVoice } },
+      { bookId, opts: { model_size: modelSize, narrator_voice_id: narratorVoice, voice_mode: voiceMode } },
       {
         onSuccess: () => {
-          setSelectedBookId(book.id);
+          setSelectedBookId(bookId);
           setView('analysis');
         },
       },
     );
+  }
+
+  function handleAnalyze() {
+    if (book) startAnalysis(book.id);
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -120,7 +129,7 @@ export function BookImport() {
             className={cn(
               'flex flex-col items-center justify-center gap-2 rounded-md border-2 border-dashed p-8 text-center cursor-pointer transition-colors',
               dragOver ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50',
-              importMutation.isPending && 'opacity-60 pointer-events-none',
+              (importMutation.isPending || analyzeMutation.isPending) && 'opacity-60 pointer-events-none',
             )}
             onClick={() => inputRef.current?.click()}
             onKeyDown={(e) => {
@@ -159,6 +168,12 @@ export function BookImport() {
         </CardContent>
       </Card>
 
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" checked={autoAnalyze} onChange={(e) => setAutoAnalyze(e.target.checked)} />
+        {t('books.import.autoAnalyze')}
+      </label>
+      {analyzeMutation.isError && <p className="text-sm text-destructive" role="alert">{t('books.import.analysisFailed')}</p>}
+
       {/* Detected metadata — only shown after a successful import */}
       {book && (
         <>
@@ -187,10 +202,21 @@ export function BookImport() {
             </CardContent>
           </Card>
 
+        </>
+      )}
+
           {/* Analysis options */}
           <Card>
             <CardContent className="p-4">
               <h2 className="text-base font-semibold mb-3">{t('books.import.analysisOptions')}</h2>
+              <div className="mb-4 flex flex-col gap-1.5">
+                <label htmlFor="book-voice-mode" className="text-xs text-muted-foreground">{t('books.import.voiceMode')}</label>
+                <select id="book-voice-mode" className="rounded border bg-background px-3 py-2 text-sm" value={voiceMode} onChange={(event) => setVoiceMode(event.target.value as 'preset' | 'designed')}>
+                  <option value="preset">{t('books.import.voiceModePreset')}</option>
+                  <option value="designed">{t('books.import.voiceModeDesigned')}</option>
+                </select>
+                <p className="text-xs text-muted-foreground">{t(voiceMode === 'designed' ? 'books.import.voiceModeDesignedHint' : 'books.import.qwenDefault')}</p>
+              </div>
               <div className="flex flex-wrap gap-4">
                 {/* Model size */}
                 <div className="flex flex-col gap-1.5 flex-1 min-w-[200px]">
@@ -240,9 +266,7 @@ export function BookImport() {
                       <SelectItem value="auto">
                         {t('books.import.narratorAuto')}
                       </SelectItem>
-                      <SelectItem value="design">
-                        {t('books.import.narratorDesign')}
-                      </SelectItem>
+
                     </SelectContent>
                   </Select>
                 </div>
@@ -256,20 +280,18 @@ export function BookImport() {
                 >
                   {t('common.cancel')}
                 </Button>
-                <Button
+                {book && <Button
                   data-testid="analyze-btn"
                   onClick={handleAnalyze}
-                  disabled={analyzeMutation.isPending}
+                  disabled={!book || analyzeMutation.isPending}
                 >
                   {analyzeMutation.isPending
                     ? t('books.import.analyzing')
                     : t('books.import.analyzeBtn')}
-                </Button>
+                </Button>}
               </div>
             </CardContent>
           </Card>
-        </>
-      )}
     </div>
   );
 }

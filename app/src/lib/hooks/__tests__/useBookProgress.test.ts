@@ -271,7 +271,7 @@ describe('useBookProgress', () => {
     expect(captured[0].payload).toEqual({
       type: 'error',
       stage: 'connection',
-      message: 'SSE connection error',
+      message: 'Progress connection interrupted. Reconnecting automatically; the task continues in the background.',
     });
   });
 

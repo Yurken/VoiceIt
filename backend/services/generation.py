@@ -18,12 +18,23 @@ from __future__ import annotations
 
 import asyncio
 import traceback
+import weakref
 from typing import Literal, Optional
 
 from .. import config
-from . import history, profiles
 from ..database import get_db
 from ..utils.tasks import get_task_manager
+from . import history, profiles
+
+_inference_locks = weakref.WeakKeyDictionary()
+
+
+def inference_lock() -> asyncio.Lock:
+    """Coordinate native model loading/inference while book jobs run concurrently."""
+    loop = asyncio.get_running_loop()
+    if loop not in _inference_locks:
+        _inference_locks[loop] = asyncio.Lock()
+    return _inference_locks[loop]
 
 
 async def run_generation(
@@ -48,9 +59,9 @@ async def run_generation(
     This is the single entry point for all background generation work.
     It is designed to be enqueued via ``services.task_queue.enqueue_generation``.
     """
-    from ..backends import load_engine_model, get_tts_backend_for_engine, engine_needs_trim
-    from ..utils.chunked_tts import generate_chunked
+    from ..backends import engine_needs_trim, get_tts_backend_for_engine, load_engine_model
     from ..utils.audio import normalize_audio, save_audio, trim_tts_output
+    from ..utils.chunked_tts import generate_chunked
 
     task_manager = get_task_manager()
     bg_db = next(get_db())
@@ -61,30 +72,17 @@ async def run_generation(
         if not tts_model.is_loaded():
             await history.update_generation_status(generation_id, "loading_model", bg_db)
 
-        await load_engine_model(engine, model_size)
-
-        voice_prompt = await profiles.create_voice_prompt_for_profile(
-            profile_id,
-            bg_db,
-            use_cache=True,
-            engine=engine,
-        )
-
-        await history.update_generation_status(generation_id, "generating", bg_db)
-        trim_fn = trim_tts_output if engine_needs_trim(engine) else None
-
-        gen_kwargs: dict = dict(
-            language=language,
-            seed=seed if mode != "regenerate" else None,
-            instruct=instruct,
-            trim_fn=trim_fn,
-        )
-        if max_chunk_chars is not None:
-            gen_kwargs["max_chunk_chars"] = max_chunk_chars
-        if crossfade_ms is not None:
-            gen_kwargs["crossfade_ms"] = crossfade_ms
-
-        audio, sample_rate = await generate_chunked(tts_model, text, voice_prompt, **gen_kwargs)
+        async with inference_lock():
+            await load_engine_model(engine, model_size)
+            voice_prompt = await profiles.create_voice_prompt_for_profile(profile_id, bg_db, use_cache=True, engine=engine)
+            await history.update_generation_status(generation_id, "generating", bg_db)
+            trim_fn = trim_tts_output if engine_needs_trim(engine) else None
+            gen_kwargs: dict = dict(language=language, seed=seed, instruct=instruct, trim_fn=trim_fn)
+            if max_chunk_chars is not None:
+                gen_kwargs["max_chunk_chars"] = max_chunk_chars
+            if crossfade_ms is not None:
+                gen_kwargs["crossfade_ms"] = crossfade_ms
+            audio, sample_rate = await generate_chunked(tts_model, text, voice_prompt, **gen_kwargs)
 
         # --- Normalize (generate and regenerate always; retry skips) -----
         if normalize or mode == "regenerate":
@@ -267,9 +265,9 @@ async def generate_audio_sync(
     normalize, then encodes in-memory via :func:`tts.audio_to_wav_bytes`
     (same helper ``/generate/stream`` uses).
     """
-    from ..backends import load_engine_model, get_tts_backend_for_engine, engine_needs_trim
-    from ..utils.chunked_tts import generate_chunked
+    from ..backends import engine_needs_trim, get_tts_backend_for_engine, load_engine_model
     from ..utils.audio import normalize_audio, trim_tts_output
+    from ..utils.chunked_tts import generate_chunked
     from . import tts
 
     bg_db = next(get_db())
@@ -331,9 +329,9 @@ def _save_regenerate(
 
     Returns the audio path.
     """
-    from . import versions as versions_mod
-
     import uuid as _uuid
+
+    from . import versions as versions_mod
 
     suffix = _uuid.uuid4().hex[:8]
     audio_path = config.get_generations_dir() / f"{generation_id}_{suffix}.wav"

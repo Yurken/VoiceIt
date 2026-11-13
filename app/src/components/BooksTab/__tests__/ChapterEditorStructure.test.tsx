@@ -46,6 +46,9 @@ interface MergeRequest {
   chapterId: string;
 }
 
+let segmentVoiceStage: string | null = null;
+let segmentFlag: boolean | undefined;
+let segmentWarnings: string[] = [];
 let updateRequests: UpdateRequest[];
 let splitRequests: SplitRequest[];
 let mergeRequests: MergeRequest[];
@@ -77,6 +80,9 @@ vi.mock('@/lib/hooks/useBooks', () => ({
     data: [
       {
         id: '18',
+        flagged: segmentFlag,
+        voice_stage: segmentVoiceStage,
+        analysis_metadata: { warnings: segmentWarnings },
         order: 0,
         type: 'dialogue',
         character_id: 'h',
@@ -143,6 +149,9 @@ async function openDialogFor(segId: string, user: ReturnType<typeof userEvent.se
 
 describe('ChapterEditor — per-line ⋯ menu and SelectionDialog (C15)', () => {
   beforeEach(() => {
+    segmentVoiceStage = null;
+    segmentFlag = undefined;
+    segmentWarnings = [];
     updateRequests = [];
     splitRequests = [];
     mergeRequests = [];
@@ -157,6 +166,64 @@ describe('ChapterEditor — per-line ⋯ menu and SelectionDialog (C15)', () => 
     useBooksStore.getState().reset();
     useBooksStore.getState().setSelectedBookId('b1');
     useBooksStore.getState().setSelectedChapterId('c1');
+  });
+
+
+
+  it('persists a reviewed flag for an explicitly flagged segment', async () => {
+    segmentFlag = true;
+    const user = userEvent.setup();
+    render(<ChapterEditor />);
+    expect(screen.getByTestId('review-rail')).toHaveTextContent('Hold the light steady.');
+    await user.click(screen.getByTestId('reviewed-18'));
+    expect(updateRequests).toEqual([{ segmentId: '18', data: { flagged: false }, bookId: 'b1', chapterId: 'c1' }]);
+  });
+
+  it('keeps a reviewed segment out of the review list even when source warnings remain', () => {
+    segmentFlag = false;
+    segmentWarnings = ['Source extraction required a fallback'];
+    render(<ChapterEditor />);
+    expect(screen.getByTestId('review-rail')).not.toHaveTextContent('Hold the light steady.');
+    expect(screen.getByTestId('review-progress')).toHaveTextContent('0 segments need review');
+  });
+
+
+  it('offers only no adjustment and the four broad age stages', async () => {
+    const user = userEvent.setup();
+    render(<ChapterEditor />);
+    const dialog = await openDialogFor('18', user);
+    const choices = within(within(dialog).getByTestId('voice-stage-input')).getAllByRole('option');
+    expect(choices.map((option) => option.textContent)).toEqual(['No adjustment', 'Youth', 'Young adult', 'Middle-aged', 'Older adult']);
+    expect(dialog).toHaveTextContent('No exact age is needed');
+  });
+
+  it.each([['儿童', '少年', 'Youth'], ['成年', '青年', 'Young adult']])('presents legacy %s as the broad stage %s', async (legacy, stage, label) => {
+    segmentVoiceStage = legacy;
+    const user = userEvent.setup();
+    render(<ChapterEditor />);
+    expect(screen.getByTitle('Age stage')).toHaveTextContent(label);
+    const dialog = await openDialogFor('18', user);
+    expect(within(dialog).getByTestId('voice-stage-input')).toHaveValue(stage);
+  });
+
+  it('clears the age adjustment with a null value while keeping the character voice', async () => {
+    segmentVoiceStage = '中年';
+    const user = userEvent.setup();
+    render(<ChapterEditor />);
+    const dialog = await openDialogFor('18', user);
+    await user.selectOptions(within(dialog).getByTestId('voice-stage-input'), '');
+    await user.click(within(dialog).getByTestId('apply-btn'));
+    expect(updateRequests).toEqual([{ segmentId: '18', data: { voice_stage: null }, bookId: 'b1', chapterId: 'c1' }]);
+  });
+
+  it('saves a segment age stage without changing the character base voice', async () => {
+    const user = userEvent.setup();
+    render(<ChapterEditor />);
+    const dialog = await openDialogFor('18', user);
+    await user.selectOptions(within(dialog).getByTestId('voice-stage-input'), '少年');
+    await user.click(within(dialog).getByTestId('apply-btn'));
+    expect(updateRequests).toEqual([{ segmentId: '18', data: { voice_stage: '少年' }, bookId: 'b1', chapterId: 'c1' }]);
+    expect(screen.queryByTestId('selection-dialog')).not.toBeInTheDocument();
   });
 
   it('exposes a ⋯ menu trigger next to every rendered segment', () => {
@@ -260,7 +327,7 @@ describe('ChapterEditor — per-line ⋯ menu and SelectionDialog (C15)', () => 
     render(<ChapterEditor />);
     const dialog = await openDialogFor('18', u);
     await u.click(within(dialog).getByTestId('edit-text-btn'));
-    const textarea = within(dialog).getByRole('textbox');
+    const textarea = within(dialog).getByPlaceholderText('Edit the text…');
     expect(textarea).toBeInTheDocument();
     expect(textarea).toHaveValue(
       "Hold the light steady. It's coming from the pump room, said the Mayor.",
@@ -272,7 +339,7 @@ describe('ChapterEditor — per-line ⋯ menu and SelectionDialog (C15)', () => 
     render(<ChapterEditor />);
     const dialog = await openDialogFor('18', u);
     await u.click(within(dialog).getByTestId('edit-text-btn'));
-    const textarea = within(dialog).getByRole('textbox');
+    const textarea = within(dialog).getByPlaceholderText('Edit the text…');
     await u.clear(textarea);
     await u.type(textarea, 'A new line.');
     await u.click(within(dialog).getByTestId('apply-btn'));
@@ -280,7 +347,7 @@ describe('ChapterEditor — per-line ⋯ menu and SelectionDialog (C15)', () => 
     expect(updateRequests).toEqual([
       expect.objectContaining({
         segmentId: '18',
-        data: { text: 'A new line.' },
+        data: { text: 'A new line.', voice_stage: null },
       }),
     ]);
   });

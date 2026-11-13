@@ -32,6 +32,7 @@ def register_routers(app: FastAPI) -> None:
     from .speak import router as speak_router
     from .mcp_bindings import router as mcp_bindings_router
     from .events import router as events_router
+    from .voice_prompts import router as voice_prompts_router
 
     app.include_router(health_router)
     app.include_router(profiles_router)
@@ -60,3 +61,4 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(speak_router)
     app.include_router(mcp_bindings_router)
     app.include_router(events_router)
+    app.include_router(voice_prompts_router)

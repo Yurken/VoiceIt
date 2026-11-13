@@ -12,9 +12,11 @@ function statusVariant(status: BookStatus): 'default' | 'secondary' | 'outline' 
   switch (status) {
     case 'analyzed':
     case 'completed':
+    case 'ready':
       return 'default';
     case 'generating':
     case 'analyzing':
+    case 'exporting':
       return 'secondary';
     case 'error':
       return 'destructive';
@@ -38,6 +40,9 @@ function BookCard({ book, onSelect }: BookCardProps) {
     <Card
       data-book-id={book.id}
       className="cursor-pointer hover:bg-accent transition-colors"
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(book); } }}
       onClick={() => onSelect(book)}
     >
       <CardContent className="p-4">
@@ -74,7 +79,7 @@ export function BookLibrary() {
   function handleSelectBook(book: BookResponse) {
     setSelectedBookId(book.id);
     // Books still being processed go to analysis view, ready books go to overview
-    const analysisStatuses: BookStatus[] = ['analyzing', 'imported'];
+    const analysisStatuses: BookStatus[] = ['analyzing'];
     if (analysisStatuses.includes(book.status)) {
       setView('analysis');
     } else {

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import i18n from '@/i18n';
 import { apiClient } from '@/lib/api/client';
 import type {
   AnalysisCompleteEvent,
@@ -80,7 +81,7 @@ export function useBookProgress(bookId: string, handlers: BookProgressHandlers):
     source.onerror = () => {
       // Transient connection error — do NOT close; let EventSource auto-reconnect.
       // Notify the optional error handler so the UI can show a retry indicator.
-      handlersRef.current.onError?.({ type: 'error', stage: 'connection', message: 'SSE connection error' });
+      handlersRef.current.onError?.({ type: 'error', stage: 'connection', message: i18n.t('books.analysis.connectionRetry') });
     };
 
     return () => {

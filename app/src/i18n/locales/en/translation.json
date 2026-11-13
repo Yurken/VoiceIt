@@ -34,7 +34,9 @@
       "analyzed": "analyzed",
       "generating": "generating",
       "completed": "completed",
-      "error": "error"
+      "error": "error",
+      "ready": "Ready",
+      "exporting": "Exporting"
     },
     "import": {
       "btn": "+ Import book",
@@ -59,7 +61,14 @@
       "narratorAuto": "Auto (neutral, distinct)",
       "narratorDesign": "Design from description…",
       "analyzeBtn": "Analyze book",
-      "analyzing": "Analyzing…"
+      "analyzing": "Analyzing…",
+      "autoAnalyze": "Automatically analyze characters and assign voices after upload",
+      "analysisFailed": "The book was saved, but analysis could not start. Retry below.",
+      "qwenDefault": "Uses existing Qwen voices by default. Each character keeps one base voice throughout the book.",
+      "voiceMode": "Character voice source",
+      "voiceModePreset": "Qwen built-in voices (default)",
+      "voiceModeDesigned": "BreezeBlue custom voices",
+      "voiceModeDesignedHint": "Match character descriptions to voice prompts, then create a fixed custom voice for each character using Breeze."
     },
     "analysis": {
       "title": "Analyzing \"{{title}}\"",
@@ -80,7 +89,9 @@
       "stageCast": "Cast voices",
       "stageDone": "done",
       "stageRunning": "running",
-      "stagePending": "pending"
+      "stagePending": "pending",
+      "connectionRetry": "Progress connection interrupted. Reconnecting automatically; the task continues in the background.",
+      "failed": "Analysis failed. Please retry."
     },
     "overview": {
       "generateAll": "Generate all",
@@ -107,7 +118,13 @@
         "none": "none",
         "ready": "ready",
         "partial": "partial",
-        "error": "errors"
+        "error": "errors",
+        "pending": "Queued",
+        "queued": "Queued",
+        "generating": "Generating",
+        "completed": "Completed",
+        "done": "done",
+        "stale": "Needs regeneration"
       },
       "confidence": {
         "high": "high",
@@ -121,8 +138,29 @@
       },
       "toast": {
         "mergeFailed": "Merge failed",
-        "deleteFailed": "Delete failed"
-      }
+        "deleteFailed": "Delete failed",
+        "alreadyGenerating": "Already generating",
+        "alreadyGeneratingDesc": "Wait for the current task to finish, then retry.",
+        "generateFailed": "Generate failed",
+        "queued": "Added to generation queue",
+        "queuedDesc": "{{count}} chapters will use consistent book-wide voices."
+      },
+      "retryChapter": "Retry errors",
+      "narration": "Narration",
+      "lines": "{{count}} lines",
+      "words": "{{count}} words",
+      "generateSelected": "Generate selected ({{count}})",
+      "selectAll": "Select all chapters",
+      "selectChapter": "Select chapter {{number}}",
+      "concurrency": "Concurrent chapters",
+      "queueHint": "Qwen by default · {{count}} chapter tasks can progress together; local inference is controlled to fit available memory. Existing audio is reused and errors retried.",
+      "voiceConsistency": "One base voice per character throughout the book. Edit chapters to adjust attribution, emotion, and age stage.",
+      "noCharacters": "Analyze the book first to assign characters and voices before generating.",
+      "analyze": "Analyze characters and assign voices",
+      "playChapter": "Play chapter {{number}}",
+      "generationProgress": "generating {{completed}}/{{total}}",
+      "defaultEngine": "Qwen default · character voice settings respected",
+      "backToLibrary": "Back to library"
     },
     "voiceEditor": {
       "backToOverview": "Overview",
@@ -194,7 +232,17 @@
       "assignExplainerPreview": "Generate preview",
       "assignExplainerPreviewNote": "auditions a ~10s sample.",
       "assignExplainerSave": "★ Save to library",
-      "assignExplainerSaveNote": "makes this voice reusable in other books. Rendering the audiobook happens on the Overview."
+      "assignExplainerSaveNote": "makes this voice reusable in other books. Rendering the audiobook happens on the Overview.",
+      "breezeHint": "Use BreezeBlue to create a consistent custom voice from a description. Choose a prompt below or edit your own; the assigned voice is reused throughout the book.",
+      "promptLibrary": "Voice prompt library",
+      "promptCount": "({{count}} prompts)",
+      "promptSearch": "Search character, style, or voice description…",
+      "promptCategory": "Prompt category",
+      "promptAllCategories": "All categories",
+      "promptLoadError": "Could not load prompts. You can still write a description below.",
+      "promptRefine": "{{count}} matching prompts; showing the first 60. Search or filter to narrow the results.",
+      "confidenceLevel": "{{level}} confidence",
+      "cloneFailed": "Clone failed"
     },
     "chapterEditor": {
       "backToOverview": "Overview",
@@ -241,7 +289,98 @@
       "applyBtn": "Apply",
       "editPlaceholder": "Edit the text…",
       "errorNonAdjacentMerge": "Cannot merge: segments are not adjacent.",
-      "errorEdgeSplit": "Cannot split: offset is at the segment boundary."
+      "errorEdgeSplit": "Cannot split: offset is at the segment boundary.",
+      "readalongStop": "Stop",
+      "audio": "Audio",
+      "noFlagged": "No low-confidence lines to review.",
+      "previousChapter": "Previous chapter",
+      "nextChapter": "Next chapter",
+      "voiceStage": "Age stage",
+      "voiceStagePlaceholder": "Choose a broad stage; no exact age is needed",
+      "voiceStageHint": "Follow growth or time changes in the story with broad age stages. No exact age is needed; keep the same character base voice.",
+      "regenerate": "Regenerate",
+      "regenerating": "Re-rendering…",
+      "regenerateLine": "Regenerate this line",
+      "deliveryTitle": "Emotion and delivery for this line",
+      "intensity": "Intensity: {{value}}%",
+      "instruction": "Instruction (optional)",
+      "instructionPlaceholder": "E.g. speak with a trembling voice",
+      "previewLine": "▶ Preview this line",
+      "previewing": "Previewing…",
+      "emotions": {
+        "neutral": "neutral",
+        "happy": "happy",
+        "sad": "sad",
+        "angry": "angry",
+        "tense": "tense",
+        "afraid": "afraid",
+        "whisper": "whisper",
+        "urgent": "urgent"
+      },
+      "reviewPending": "{{count}} segments need review",
+      "previewAudio": "Line preview audio",
+      "previewFailed": "Preview failed",
+      "voiceStageUnchanged": "No adjustment",
+      "voiceStages": {
+        "youth": "Youth",
+        "youngAdult": "Young adult",
+        "middleAged": "Middle-aged",
+        "olderAdult": "Older adult"
+      }
+    },
+    "export": {
+      "title": "Export Audiobook",
+      "back": "Back to overview",
+      "format": "Format",
+      "m4b": "M4B Audiobook",
+      "mp3_single": "MP3 (single file)",
+      "mp3_per_chapter": "MP3 per chapter (ZIP)",
+      "quality": "Quality",
+      "bitrate": "Bitrate",
+      "metadata": "Metadata",
+      "bookTitle": "Title",
+      "author": "Author",
+      "bookTitlePlaceholder": "Book title",
+      "authorPlaceholder": "Author name",
+      "ready": "Ready to export. Choose your format and click Start. Generate the required chapters first.",
+      "starting": "Starting export...",
+      "exporting": "Exporting…",
+      "complete": "Export complete",
+      "failed": "Export failed",
+      "downloadFailed": "Download failed",
+      "done": "Done",
+      "start": "Start Export",
+      "downloading": "Downloading…",
+      "download": "Download {{ext}}",
+      "cover": "Cover image",
+      "coverDrop": "Drop cover image here",
+      "coverBrowse": "or click to browse"
+    },
+    "gender": {
+      "male": "Male",
+      "female": "Female",
+      "unknown": "Unspecified",
+      "neutral": "Neutral"
+    },
+    "voiceTypes": {
+      "preset": "Preset",
+      "designed": "Designed",
+      "cloned": "Cloned"
+    },
+    "roles": {
+      "major": "Major",
+      "minor": "Minor",
+      "narrator": "Narrator",
+      "supporting": "Supporting",
+      "protagonist": "Protagonist",
+      "antagonist": "Antagonist"
+    },
+    "languages": {
+      "zh": "Chinese",
+      "en": "English",
+      "ja": "Japanese",
+      "ko": "Korean",
+      "yue": "Cantonese"
     }
   },
   "captures": {
@@ -993,8 +1132,13 @@
       }
     },
     "general": {
-      "docs": { "title": "Read the Docs" },
-      "discord": { "title": "Join the Discord", "subtitle": "Get help & share voices" },
+      "docs": {
+        "title": "Read the Docs"
+      },
+      "discord": {
+        "title": "Join the Discord",
+        "subtitle": "Get help & share voices"
+      },
       "serverUrl": {
         "title": "Server URL",
         "description": "The address of your voiceit backend server.",

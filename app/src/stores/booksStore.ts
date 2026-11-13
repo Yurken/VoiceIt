@@ -25,6 +25,8 @@ interface BooksState {
   setSelectedCharacterId: (id: string | null) => void;
 
   // Read-along playback state
+  playbackChapterRequest: string | null;
+  requestChapterPlayback: (id: string | null) => void;
   readAlongPlaying: boolean;
   setReadAlong: (playing: boolean) => void;
   currentSpokenSegmentId: string | null;
@@ -40,6 +42,7 @@ const INITIAL_STATE = {
   selectedChapterId: null,
   selectedSegmentId: null,
   selectedCharacterId: null,
+  playbackChapterRequest: null,
   readAlongPlaying: false,
   currentSpokenSegmentId: null,
 };
@@ -54,6 +57,7 @@ export const useBooksStore = create<BooksState>((set) => ({
   setSelectedSegmentId: (id) => set({ selectedSegmentId: id }),
   setSelectedCharacterId: (id) => set({ selectedCharacterId: id }),
 
+  requestChapterPlayback: (id) => set({ playbackChapterRequest: id }),
   setReadAlong: (playing) => set({ readAlongPlaying: playing }),
   setCurrentSpokenSegment: (id) => set({ currentSpokenSegmentId: id }),
 

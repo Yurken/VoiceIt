@@ -10,7 +10,8 @@ the result to a target LUFS, then emits one of three formats:
   * ``mp3_per_chapter``– ZIP archive containing one ID3-tagged MP3 per chapter
 
 All heavy lifting (concatenation, encoding) is delegated to FFmpeg; Python only
-drives the process and applies loudness normalization before encoding.
+streams one segment at a time to disk-backed chapter files, then FFmpeg applies
+loudness normalization during encoding. Whole-book audio is never held in RAM.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import soundfile as sf
 
-from backend.utils.audio import load_audio, normalize_loudness
+from backend.utils.audio import load_audio
 
 # ---------------------------------------------------------------------------
 # Default pause durations
@@ -121,11 +122,9 @@ def _write_wav_to_tmp(audio: np.ndarray, sample_rate: int) -> str:
 
 def _run_ffmpeg(cmd: List[str]) -> None:
     """Run an FFmpeg command; raise RuntimeError on failure."""
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # Avoid retaining FFmpeg's periodic status output for multi-hour books.
+    command = [cmd[0], "-hide_banner", "-loglevel", "error", "-nostats", *cmd[1:]]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         raise RuntimeError(
             f"FFmpeg failed (exit {result.returncode}):\n"
@@ -133,22 +132,43 @@ def _run_ffmpeg(cmd: List[str]) -> None:
         )
 
 
+def _audio_input(path: str, concat: bool = False) -> List[str]:
+    """Describe a single audio file or an ffconcat manifest without shell parsing."""
+    return (["-f", "concat", "-safe", "0"] if concat else []) + ["-i", path]
+
+
+def _normalization_args(target_lufs: Optional[float], sample_rate: int) -> List[str]:
+    if target_lufs is None:
+        return []
+    # FFmpeg processes the stream with bounded filter buffers instead of loading
+    # an entire multi-hour book into Python. Set the rate explicitly because
+    # dynamic loudnorm internally upsamples to 192 kHz.
+    return ["-af", f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11", "-ar", str(sample_rate)]
+
+
 def _encode_mp3(
     wav_path: str,
     out_path: str,
     bitrate: str = DEFAULT_BITRATE,
     channels: int = DEFAULT_CHANNELS,
+    *,
+    concat: bool = False,
+    target_lufs: Optional[float] = None,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
 ) -> None:
-    """Encode *wav_path* to MP3 at *out_path*."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", wav_path,
-        "-codec:a", "libmp3lame",
-        "-b:a", bitrate,
-        "-ac", str(channels),
-        out_path,
-    ]
+    """Encode one file or a disk-backed book manifest to MP3."""
+    cmd = ["ffmpeg", "-y"] + _audio_input(wav_path, concat)
+    cmd += _normalization_args(target_lufs, sample_rate)
+    cmd += ["-codec:a", "libmp3lame", "-b:a", bitrate, "-ac", str(channels), out_path]
     _run_ffmpeg(cmd)
+
+
+def _metadata_value(value: str) -> str:
+    """Escape literal user text for FFmetadata, including chapter titles."""
+    escaped = str(value).replace("\\", "\\\\")
+    for character in ("=", ";", "#", "\n", "\r"):
+        escaped = escaped.replace(character, "\\" + character)
+    return escaped
 
 
 def _encode_aac_m4b(
@@ -161,27 +181,28 @@ def _encode_aac_m4b(
     cover_path: Optional[str] = None,
     bitrate: str = DEFAULT_BITRATE,
     channels: int = DEFAULT_CHANNELS,
+    *,
+    concat: bool = False,
+    target_lufs: Optional[float] = None,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    total_duration_s: Optional[float] = None,
 ) -> None:
     """Encode *wav_path* → M4B with embedded chapter markers via FFmpeg metadata."""
     # Build FFmpeg chapter metadata
     metadata_lines = [
         ";FFMETADATA1",
-        f"title={title}",
-        f"artist={author}",
+        f"title={_metadata_value(title)}",
+        f"artist={_metadata_value(author)}",
         "",
     ]
-    # Calculate total duration from the wav to get end times
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            wav_path,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    total_duration_s = float(json.loads(result.stdout)["format"]["duration"])
+    if total_duration_s is None:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", wav_path],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        total_duration_s = float(json.loads(result.stdout)["format"]["duration"])
 
     for i, (ch, start_s) in enumerate(zip(chapters, chapter_starts_s)):
         end_s = chapter_starts_s[i + 1] if i + 1 < len(chapter_starts_s) else total_duration_s
@@ -193,7 +214,7 @@ def _encode_aac_m4b(
             "TIMEBASE=1/1000",
             f"START={start_ms}",
             f"END={end_ms}",
-            f"title={ch_title}",
+            f"title={_metadata_value(ch_title)}",
             "",
         ]
 
@@ -202,32 +223,15 @@ def _encode_aac_m4b(
         with os.fdopen(fd, "w") as f:
             f.write("\n".join(metadata_lines))
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", wav_path,
-            "-i", meta_path,
-            "-map_metadata", "1",
-            "-codec:a", "aac",
-            "-b:a", bitrate,
-            "-ac", str(channels),
-            "-f", "ipod",
-        ]
+        cmd = ["ffmpeg", "-y"] + _audio_input(wav_path, concat) + ["-i", meta_path]
         if cover_path and Path(cover_path).exists():
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", wav_path,
-                "-i", meta_path,
-                "-i", cover_path,
-                "-map", "0:a",
-                "-map", "2:v",
-                "-map_metadata", "1",
-                "-codec:a", "aac",
-                "-b:a", bitrate,
-                "-ac", str(channels),
-                "-codec:v", "mjpeg",
-                "-disposition:v", "attached_pic",
-                "-f", "ipod",
-            ]
+            cmd += ["-i", cover_path, "-map", "0:a:0", "-map", "2:v:0",
+                    "-codec:v", "mjpeg", "-disposition:v:0", "attached_pic"]
+        else:
+            cmd += ["-map", "0:a:0"]
+        cmd += ["-map_metadata", "1", "-map_chapters", "1"]
+        cmd += _normalization_args(target_lufs, sample_rate)
+        cmd += ["-codec:a", "aac", "-b:a", bitrate, "-ac", str(channels), "-f", "ipod"]
         cmd.append(out_path)
         _run_ffmpeg(cmd)
     finally:
@@ -242,43 +246,37 @@ def _embed_mp3_tags(
     track_num: Optional[int] = None,
     cover_path: Optional[str] = None,
 ) -> None:
-    """Write ID3 tags (and optionally embed cover art) into an existing MP3."""
-    from mutagen.id3 import (
-        APIC,
-        ID3,
-        ID3NoHeaderError,
-        TALB,
-        TPE1,
-        TRCK,
-        TIT2,
-    )
-    import mimetypes
+    """Atomically remux MP3 ID3 tags and optional cover art using FFmpeg.
 
+    Audio packets are copied without another lossy encode. The original file
+    remains intact if FFmpeg fails, and the sibling temporary file is always
+    removed. No optional Python tagging dependency is required.
+    """
+    source = Path(mp3_path)
+    fd, tagged_path = tempfile.mkstemp(prefix=f".{source.stem}-tags-", suffix=".mp3", dir=source.parent)
+    os.close(fd)
     try:
-        tags = ID3(mp3_path)
-    except ID3NoHeaderError:
-        tags = ID3()
-
-    if title:
-        tags["TIT2"] = TIT2(encoding=3, text=title)
-    if album:
-        tags["TALB"] = TALB(encoding=3, text=album)
-    if artist:
-        tags["TPE1"] = TPE1(encoding=3, text=artist)
-    if track_num is not None:
-        tags["TRCK"] = TRCK(encoding=3, text=str(track_num))
-    if cover_path and Path(cover_path).exists():
-        mime = mimetypes.guess_type(cover_path)[0] or "image/jpeg"
-        with open(cover_path, "rb") as img_f:
-            tags["APIC:"] = APIC(
-                encoding=3,
-                mime=mime,
-                type=3,   # Cover (front)
-                desc="Cover",
-                data=img_f.read(),
-            )
-
-    tags.save(mp3_path)
+        cmd = ["ffmpeg", "-y", "-i", str(source)]
+        has_cover = bool(cover_path and Path(cover_path).is_file())
+        if has_cover:
+            cmd += ["-i", str(cover_path), "-map", "0:a:0", "-map", "1:v:0"]
+        else:
+            # Preserve an existing attached picture when only tags are changed.
+            cmd += ["-map", "0:a:0", "-map", "0:v?"]
+        cmd += ["-map_metadata", "0", "-codec:a", "copy", "-codec:v", "copy",
+                "-id3v2_version", "3"]
+        for key, value in (("title", title), ("album", album), ("artist", artist)):
+            if value:
+                cmd += ["-metadata", f"{key}={value}"]
+        if track_num is not None:
+            cmd += ["-metadata", f"track={track_num}"]
+        if has_cover:
+            cmd += ["-disposition:v:0", "attached_pic", "-metadata:s:v:0", "title=Cover",
+                    "-metadata:s:v:0", "comment=Cover (front)"]
+        _run_ffmpeg(cmd + [tagged_path])
+        os.replace(tagged_path, source)
+    finally:
+        Path(tagged_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +312,48 @@ def read_chapter_markers(file_path: str) -> List[Dict[str, Any]]:
         start = float(ch.get("start_time", 0))
         markers.append({"title": title, "start": start})
     return markers
+
+
+def _write_chapter_wav(
+    segment_paths: List[Union[str, Dict[str, Any]]],
+    output_path: str,
+    sample_rate: int,
+    inter_segment_pause_s: float,
+    scene_pause_s: float,
+) -> int:
+    """Write one segment at a time and return its exact PCM frame count.
+
+    RF64 supports large chapters beyond the WAV 4 GiB limit. Only a single
+    generated segment and the short pause buffers reside in Python memory.
+    Unreadable segments are skipped just as in the original stitch helper.
+    """
+    inter_silence = _make_silence(inter_segment_pause_s, sample_rate)
+    scene_silence = _make_silence(scene_pause_s, sample_rate)
+    total_frames = 0
+    with sf.SoundFile(output_path, "w", samplerate=sample_rate, channels=1,
+                      format="RF64", subtype="PCM_16") as output:
+        for entry in segment_paths:
+            path = entry.get("path") if isinstance(entry, dict) else entry
+            scene_break = bool(entry.get("is_scene_break", False)) if isinstance(entry, dict) else False
+            try:
+                audio, _ = load_audio(path, sample_rate=sample_rate, mono=True)
+            except Exception:
+                continue
+            if not len(audio):
+                continue
+            if total_frames:
+                pause = scene_silence if scene_break else inter_silence
+                output.write(pause)
+                total_frames += len(pause)
+            output.write(audio)
+            total_frames += len(audio)
+    return total_frames
+
+
+def _concat_file_line(path: str) -> str:
+    # Escaping is ffconcat syntax, not shell quoting; subprocess receives argv.
+    escaped = str(Path(path).resolve()).replace("'", "'\\''")
+    return f"file '{escaped}'"
 
 
 # ---------------------------------------------------------------------------
@@ -388,145 +428,87 @@ def export_book(
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    _progress(0, "Starting export")
+    _progress(0, "正在准备导出")
 
-    # ------------------------------------------------------------------
-    # Step 1: Stitch each chapter into a WAV array
-    # ------------------------------------------------------------------
-    chapter_audios: List[np.ndarray] = []
-    chapter_starts_s: List[float] = []
-    # chapters_with_audio is aligned 1:1 with chapter_audios / chapter_starts_s;
-    # chapters that produce no audio (all segments missing) are excluded so that
-    # M4B chapter markers are never mis-paired with the wrong titles.
-    chapters_with_audio: List[Dict[str, Any]] = []
-    chapter_pause_silence = _make_silence(chapter_pause, sample_rate)
+    if fmt not in {"m4b", "mp3_single", "mp3_per_chapter"}:
+        raise ValueError(f"Unknown export format: {fmt!r}. Choose m4b, mp3_single, or mp3_per_chapter.")
 
-    n_chapters = len(chapters)
-    total_audio_parts: List[np.ndarray] = []
-    current_time_s: float = 0.0
+    safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in title).strip() or "audiobook"
+    # Temporary audio lives beside the export on the user's configured disk.
+    # Closing this context removes staged chapters on both success and failure.
+    with tempfile.TemporaryDirectory(prefix=".voiceit-export-", dir=output_dir) as work_dir:
+        chapter_files: List[Tuple[Dict[str, Any], str]] = []
+        chapter_starts_s: List[float] = []
+        concat_lines = ["ffconcat version 1.0"]
+        current_frames = 0
+        pause_audio = _make_silence(chapter_pause, sample_rate)
+        pause_path = str(Path(work_dir) / "chapter-pause.wav")
+        sf.write(pause_path, pause_audio, sample_rate, subtype="PCM_16")
+        n_chapters = len(chapters)
 
-    for idx, ch in enumerate(chapters):
-        pct = int(5 + (idx / n_chapters) * 50)
-        _progress(pct, f"Stitching chapter {ch.get('number', idx + 1)}")
+        for idx, chapter in enumerate(chapters):
+            _progress(int(5 + idx / max(n_chapters, 1) * 50),
+                      f"正在拼接第 {chapter.get('number', idx + 1)} 章")
+            chapter_path = str(Path(work_dir) / f"chapter-{idx:06d}.wav")
+            frames = _write_chapter_wav(chapter.get("segment_paths", []), chapter_path,
+                                        sample_rate, inter_seg_pause, scene_pause)
+            if not frames:
+                continue
+            chapter_starts_s.append(current_frames / sample_rate)
+            chapter_files.append((chapter, chapter_path))
+            concat_lines.append(_concat_file_line(chapter_path))
+            current_frames += frames
+            # Keep the original pause contract, including a pause after a valid
+            # chapter followed by an entirely missing source chapter.
+            if idx < n_chapters - 1:
+                concat_lines.append(_concat_file_line(pause_path))
+                current_frames += len(pause_audio)
 
-        ch_audio = _stitch_chapter(
-            ch.get("segment_paths", []),
-            sample_rate=sample_rate,
-            inter_segment_pause_s=inter_seg_pause,
-            scene_pause_s=scene_pause,
-        )
-        if ch_audio is None:
-            continue  # skip empty chapters
+        if not chapter_files:
+            raise ValueError("No audio could be loaded from any segment in any chapter.")
 
-        chapter_starts_s.append(current_time_s)
-        chapter_audios.append(ch_audio)
-        chapters_with_audio.append(ch)
-        total_audio_parts.append(ch_audio)
-        current_time_s += len(ch_audio) / sample_rate
+        manifest = str(Path(work_dir) / "book.ffconcat")
+        Path(manifest).write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+        _progress(60, "正在准备响度标准化")
 
-        # Add chapter pause between chapters (not after the last)
-        if idx < n_chapters - 1:
-            total_audio_parts.append(chapter_pause_silence)
-            current_time_s += chapter_pause
-
-    if not total_audio_parts:
-        raise ValueError("No audio could be loaded from any segment in any chapter.")
-
-    _progress(55, "Concatenating chapters")
-    full_audio = np.concatenate(total_audio_parts, axis=0).astype(np.float32)
-
-    # ------------------------------------------------------------------
-    # Step 2: LUFS normalization
-    # ------------------------------------------------------------------
-    _progress(60, "Normalizing loudness")
-    full_audio = normalize_loudness(full_audio, sample_rate=sample_rate, target_lufs=target_lufs)
-
-    # ------------------------------------------------------------------
-    # Step 3: Write master WAV to a temp file
-    # ------------------------------------------------------------------
-    _progress(65, "Writing master WAV")
-    master_wav = _write_wav_to_tmp(full_audio, sample_rate)
-
-    try:
-        # Build safe base filename from title
-        safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in title).strip() or "audiobook"
-
-        # ------------------------------------------------------------------
-        # Step 4: Encode to requested format
-        # ------------------------------------------------------------------
         if fmt == "m4b":
             out_path = str(Path(output_dir) / f"{safe_title}.m4b")
-            _progress(70, "Encoding M4B")
+            staged_output = str(Path(work_dir) / "book.m4b")
+            _progress(70, "正在编码 M4B 有声书")
             _encode_aac_m4b(
-                wav_path=master_wav,
-                out_path=out_path,
-                chapters=chapters_with_audio,
-                chapter_starts_s=chapter_starts_s,
-                title=title,
-                author=author,
-                cover_path=cover_path,
-                bitrate=bitrate,
-                channels=channels,
+                manifest, staged_output, [chapter for chapter, _ in chapter_files], chapter_starts_s,
+                title=title, author=author, cover_path=cover_path, bitrate=bitrate,
+                channels=channels, concat=True, target_lufs=target_lufs,
+                sample_rate=sample_rate, total_duration_s=current_frames / sample_rate,
             )
-
         elif fmt == "mp3_single":
             out_path = str(Path(output_dir) / f"{safe_title}.mp3")
-            _progress(70, "Encoding MP3")
-            _encode_mp3(master_wav, out_path, bitrate=bitrate, channels=channels)
-            _embed_mp3_tags(
-                out_path,
-                title=title,
-                album=title,
-                artist=author,
-                cover_path=cover_path,
-            )
-
-        elif fmt == "mp3_per_chapter":
-            zip_path = str(Path(output_dir) / f"{safe_title}.zip")
-            _progress(70, "Encoding per-chapter MP3s")
-
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                # We need per-chapter WAVs for individual MP3 encoding
-                n_ch_audio = len(chapter_audios)
-                for i, (ch, ch_audio) in enumerate(zip(chapters_with_audio, chapter_audios)):
-                    ch_pct = int(70 + (i / max(n_ch_audio, 1)) * 25)
-                    ch_num = ch.get("number", i + 1)
-                    ch_title = ch.get("title", f"Chapter {ch_num}")
-                    _progress(ch_pct, f"Encoding {ch_title}")
-
-                    # Normalize per-chapter audio
-                    ch_norm = normalize_loudness(ch_audio, sample_rate=sample_rate, target_lufs=target_lufs)
-
-                    ch_wav = _write_wav_to_tmp(ch_norm, sample_rate)
-                    fd, ch_mp3 = tempfile.mkstemp(suffix=".mp3")
-                    os.close(fd)
-                    try:
-                        _encode_mp3(ch_wav, ch_mp3, bitrate=bitrate, channels=channels)
-                        _embed_mp3_tags(
-                            ch_mp3,
-                            title=ch_title,
-                            album=title,
-                            artist=author,
-                            track_num=ch_num,
-                            cover_path=cover_path,
-                        )
-                        safe_ch_title = "".join(
-                            c if c.isalnum() or c in " _-" else "_" for c in ch_title
-                        ).strip()
-                        mp3_name = f"{ch_num:02d}_{safe_ch_title}.mp3"
-                        zf.write(ch_mp3, arcname=mp3_name)
-                    finally:
-                        Path(ch_wav).unlink(missing_ok=True)
-                        Path(ch_mp3).unlink(missing_ok=True)
-
-            out_path = zip_path
-
+            staged_output = str(Path(work_dir) / "book.mp3")
+            _progress(70, "正在编码 MP3 有声书")
+            _encode_mp3(manifest, staged_output, bitrate=bitrate, channels=channels,
+                        concat=True, target_lufs=target_lufs, sample_rate=sample_rate)
+            _embed_mp3_tags(staged_output, title=title, album=title, artist=author, cover_path=cover_path)
         else:
-            raise ValueError(f"Unknown export format: {fmt!r}. Choose m4b, mp3_single, or mp3_per_chapter.")
+            out_path = str(Path(output_dir) / f"{safe_title}.zip")
+            staged_output = str(Path(work_dir) / "book.zip")
+            _progress(70, "正在逐章编码 MP3")
+            with zipfile.ZipFile(staged_output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for idx, (chapter, chapter_path) in enumerate(chapter_files):
+                    number = chapter.get("number", idx + 1)
+                    chapter_title = chapter.get("title", f"Chapter {number}")
+                    _progress(int(70 + idx / len(chapter_files) * 25), f"正在编码《{chapter_title}》")
+                    mp3_path = str(Path(work_dir) / f"chapter-{idx:06d}.mp3")
+                    _encode_mp3(chapter_path, mp3_path, bitrate=bitrate, channels=channels,
+                                target_lufs=target_lufs, sample_rate=sample_rate)
+                    _embed_mp3_tags(mp3_path, title=chapter_title, album=title, artist=author,
+                                    track_num=number, cover_path=cover_path)
+                    chapter_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in chapter_title).strip()
+                    archive.write(mp3_path, arcname=f"{number:02d}_{chapter_name}.mp3")
+                    Path(mp3_path).unlink()
 
-    finally:
-        Path(master_wav).unlink(missing_ok=True)
+        # Publish only a fully encoded and tagged artifact. A failed re-export
+        # cannot truncate an existing audiobook, and all staging shares its disk.
+        os.replace(staged_output, out_path)
 
-    _progress(100, "Export complete")
-
+    _progress(100, "导出完成")
     return out_path, Path(out_path).name

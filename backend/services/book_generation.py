@@ -13,22 +13,29 @@ Key helpers exposed for reuse by D3/D4:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+import zlib
+from collections import deque
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy.orm import Session
+
+from ..utils.voice_stages import normalize_voice_stage
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
 
-# Default TTS engine and model size used when not specified by the caller.
-# "default" is the correct sentinel for kokoro (Qwen sizes like "1.7B" are
-# for the Qwen engine; kokoro has no meaningful model_size concept).
-_DEFAULT_ENGINE = "kokoro"
-_DEFAULT_MODEL_SIZE = "default"
+# Profiles choose their own engine; unconfigured book voices default to Qwen.
+_DEFAULT_ENGINE = "qwen_custom_voice"
+_DEFAULT_MODEL_SIZE = "1.7B"
+
+
+def stable_voice_seed(profile_id: str) -> int:
+    return zlib.crc32(profile_id.encode("utf-8")) & 0x7fffffff
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +78,10 @@ def compose_instruct(segment) -> Optional[str]:
 
     if delivery:
         parts.append(delivery)
+
+    stage = normalize_voice_stage(getattr(segment, "voice_stage", None))
+    if stage:
+        parts.append(f"保持同一角色的基础音色，以{stage}阶段自然朗读，不必强调具体岁数")
 
     if not parts:
         return None
@@ -117,9 +128,13 @@ async def _per_generation_completion_hook(
     from . import book_events
 
     success = False
+    cancelled = False
     try:
         await inner_coro
         success = True
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception:
         logger.exception(
             "run_generation raised inside per-generation completion hook "
@@ -128,30 +143,36 @@ async def _per_generation_completion_hook(
             book_id,
         )
 
-    # ── Step 2: flip BookSegment.audio_status ─────────────────────────────
-    db: Session = next(database.get_db())
-    try:
-        segment = db.query(database.BookSegment).filter_by(id=segment_id).first()
-        if segment is not None:
-            segment.audio_status = "completed" if success else "error"
-            db.commit()
-
-        # ── Step 3: reflow StoryItem times if the whole chapter settled ───
-        if segment is not None:
-            chapter_id = segment.chapter_id
-            _reflow_chapter_story_times(chapter_id, db)
-
-        # ── Step 4: book-level progress events and drain ──────────────────
-        _publish_progress_and_drain(book_id, db, book_events)
-
-    except Exception:
-        logger.exception(
-            "Per-generation completion hook failed for segment %s book %s",
-            segment_id,
-            book_id,
-        )
     finally:
-        db.close()
+        # ── Step 2: flip BookSegment.audio_status ─────────────────────────────
+        db: Session = next(database.get_db())
+        try:
+            segment = db.query(database.BookSegment).filter_by(id=segment_id).first()
+            if segment is not None:
+                gen = db.query(database.Generation).filter_by(id=segment.generation_id).first()
+                success = success and gen is not None and gen.status == "completed"
+                if not success and gen is not None and gen.status in {"pending", "loading_model", "generating"}:
+                    gen.status = "failed"
+                    gen.error = gen.error or ("Generation cancelled" if cancelled else "Generation failed before completion")
+                segment.audio_status = "completed" if success else "error"
+                db.commit()
+
+            # ── Step 3: reflow StoryItem times if the whole chapter settled ───
+            if segment is not None:
+                chapter_id = segment.chapter_id
+                _reflow_chapter_story_times(chapter_id, db)
+
+            # ── Step 4: book-level progress events and drain ──────────────────
+            _publish_progress_and_drain(book_id, db, book_events)
+
+        except Exception:
+            logger.exception(
+                "Per-generation completion hook failed for segment %s book %s",
+                segment_id,
+                book_id,
+            )
+        finally:
+            db.close()
 
 
 def _reflow_chapter_story_times(chapter_id: str, db: Session) -> None:
@@ -194,8 +215,9 @@ def _reflow_chapter_story_times(chapter_id: str, db: Session) -> None:
     # Fetch StoryItems ordered by current start_time_ms (reading order)
     items = (
         db.query(database.StoryItem)
-        .filter_by(story_id=chapter.story_id)
-        .order_by(database.StoryItem.start_time_ms)
+        .join(database.BookSegment, database.BookSegment.generation_id == database.StoryItem.generation_id)
+        .filter(database.StoryItem.story_id == chapter.story_id)
+        .order_by(database.BookSegment.order)
         .all()
     )
     if not items:
@@ -408,9 +430,6 @@ def generate_chapter(
         a meaningful ``queued_segments`` count).
     """
     from .. import database
-    from . import task_queue
-    from .generation import run_generation
-
     chapter = db.query(database.Chapter).filter_by(id=chapter_id).first()
     if chapter is None:
         raise ValueError(f"Chapter {chapter_id!r} not found")
@@ -429,7 +448,7 @@ def generate_chapter(
         story = db.query(database.Story).filter_by(id=chapter.story_id).first()
 
     # ── Fetch segments in reading order ──────────────────────────────────
-    eligible_statuses = {"none"}
+    eligible_statuses = {"none", "stale"}
     if overwrite_errors:
         eligible_statuses.add("error")
 
@@ -468,7 +487,9 @@ def generate_chapter(
 
         # Resolve engine for this segment
         effective_engine = engine or _resolve_engine_for_profile(profile_id, db)
-        effective_model_size = model_size or _DEFAULT_MODEL_SIZE
+        effective_model_size = (model_size or _DEFAULT_MODEL_SIZE) if effective_engine in {"qwen", "qwen_custom_voice"} else "default"
+        from .ingestion import detect_text_language
+        language = detect_text_language(segment.text)
 
         # Create the Generation row (status starts as "pending" here; the
         # queue worker will flip it to "generating" / "completed" / "failed")
@@ -477,7 +498,8 @@ def generate_chapter(
             id=gen_id,
             profile_id=profile_id,
             text=segment.text,
-            language="en",
+            language=language,
+            seed=stable_voice_seed(profile_id),
             engine=effective_engine,
             model_size=effective_model_size,
             instruct=instruct,
@@ -486,6 +508,9 @@ def generate_chapter(
         )
         db.add(generation)
         db.flush()
+
+        if segment.generation_id:
+            db.query(database.StoryItem).filter_by(story_id=story.id, generation_id=segment.generation_id).delete()
 
         # Place the generation in the story at reading order position
         story_item = database.StoryItem(
@@ -522,6 +547,7 @@ def generate_book(
     engine: Optional[str] = None,
     model_size: Optional[str] = None,
     overwrite_errors: bool = False,
+    chapter_ids: list[str] | None = None,
     db: Session,
 ) -> tuple[int, list[str]]:
     """Enqueue audio for every chapter in *book_id*, reusing generate_chapter.
@@ -544,6 +570,13 @@ def generate_book(
         .order_by(database.Chapter.number)
         .all()
     )
+
+    if chapter_ids is not None:
+        from fastapi import HTTPException
+        known = {chapter.id for chapter in chapters}
+        if not chapter_ids or not set(chapter_ids) <= known:
+            raise HTTPException(status_code=400, detail="请选择属于本书的有效章节")
+        chapters = [chapter for chapter in chapters if chapter.id in set(chapter_ids)]
 
     total_queued = 0
     all_gen_ids: list[str] = []
@@ -619,17 +652,22 @@ def enqueue_chapter_generation(
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Chapter not found")
 
-    # Flip status synchronously — race-safe 409 guard
-    book.status = "generating"
-    db.commit()
+    _preflight_generation(book, db, [chapter_id], engine)
 
-    queued, generation_ids = generate_chapter(
-        chapter_id,
-        engine=engine,
-        model_size=model_size,
-        overwrite_errors=overwrite_errors,
-        db=db,
-    )
+    # Flip status synchronously — race-safe 409 guard
+    _claim_book_generation(book, db)
+
+    try:
+        queued, generation_ids = generate_chapter(
+            chapter_id,
+            engine=engine,
+            model_size=model_size,
+            overwrite_errors=overwrite_errors,
+            db=db,
+        )
+    except BaseException:
+        _recover_failed_materialization(book_id, db)
+        raise
 
     # Enqueue each generation through the TTS queue, wrapped with the
     # per-generation completion hook that flips BookSegment.audio_status,
@@ -655,7 +693,7 @@ def enqueue_chapter_generation(
             language=gen.language,
             engine=gen.engine,
             model_size=gen.model_size or _DEFAULT_MODEL_SIZE,
-            seed=None,
+            seed=gen.seed,
             instruct=gen.instruct,
             mode="generate",
         )
@@ -665,16 +703,18 @@ def enqueue_chapter_generation(
             book_id=book_id,
             inner_coro=inner,
         )
+        wrapped = task_queue.with_coro_cleanup(wrapped, inner)
 
         try:
             task_queue.enqueue_generation(gen_id, wrapped)
         except Exception:
+            wrapped.close()
+            inner.close()
             logger.exception("Failed to enqueue generation %s", gen_id)
             _mark_generation_error(gen_id, "Queue unavailable", db)
 
     # If nothing was queued (e.g. all segments already rendered) reset now.
-    if not generation_ids:
-        _reset_book_status_if_settled(book_id, db)
+    _reset_book_status_if_settled(book_id, db)
 
     task_id = str(uuid.uuid4())
     return task_id, queued
@@ -687,6 +727,8 @@ def enqueue_book_generation(
     engine: Optional[str] = None,
     model_size: Optional[str] = None,
     overwrite_errors: bool = False,
+    chapter_ids: list[str] | None = None,
+    concurrency: int = 2,
 ) -> tuple[str, int]:
     """409-guard, flip book status, materialise and enqueue all chapters.
 
@@ -719,17 +761,38 @@ def enqueue_book_generation(
         from fastapi import HTTPException
         raise HTTPException(status_code=409, detail="Book is already generating")
 
-    # Flip status synchronously — race-safe 409 guard
-    book.status = "generating"
-    db.commit()
+    _preflight_generation(book, db, chapter_ids, engine)
 
-    total, generation_ids = generate_book(
-        book_id,
-        engine=engine,
-        model_size=model_size,
-        overwrite_errors=overwrite_errors,
-        db=db,
-    )
+    # Flip status synchronously — race-safe 409 guard
+    _claim_book_generation(book, db)
+
+    try:
+        total, generation_ids = generate_book(
+            book_id,
+            engine=engine,
+            model_size=model_size,
+            overwrite_errors=overwrite_errors,
+            chapter_ids=chapter_ids,
+            db=db,
+        )
+    except BaseException:
+        _recover_failed_materialization(book_id, db)
+        raise
+
+    # Round-robin across chapters lets several chapters make progress together.
+    by_chapter: dict[str, deque] = {}
+    chapter_by_generation = dict(db.query(database.BookSegment.generation_id, database.BookSegment.chapter_id).join(database.Chapter).filter(database.Chapter.book_id == book_id, database.BookSegment.generation_id.isnot(None)).all())
+    for gen_id in generation_ids:
+        chapter_id = chapter_by_generation.get(gen_id)
+        if chapter_id is not None:
+            by_chapter.setdefault(chapter_id, deque()).append(gen_id)
+    generation_ids = []
+    active = deque(by_chapter.values())
+    while active:
+        chapter_queue = active.popleft()
+        generation_ids.append(chapter_queue.popleft())
+        if chapter_queue:
+            active.append(chapter_queue)
 
     # Enqueue each generation through the TTS queue, wrapped with the
     # per-generation completion hook that flips BookSegment.audio_status,
@@ -755,7 +818,7 @@ def enqueue_book_generation(
             language=gen.language,
             engine=gen.engine,
             model_size=gen.model_size or _DEFAULT_MODEL_SIZE,
-            seed=None,
+            seed=gen.seed,
             instruct=gen.instruct,
             mode="generate",
         )
@@ -765,16 +828,18 @@ def enqueue_book_generation(
             book_id=book_id,
             inner_coro=inner,
         )
+        wrapped = task_queue.with_coro_cleanup(wrapped, inner)
 
         try:
-            task_queue.enqueue_generation(gen_id, wrapped)
+            task_queue.enqueue_generation(gen_id, wrapped, group_id=book_id, concurrency=concurrency)
         except Exception:
+            wrapped.close()
+            inner.close()
             logger.exception("Failed to enqueue generation %s", gen_id)
             _mark_generation_error(gen_id, "Queue unavailable", db)
 
     # If nothing was queued (e.g. all segments already rendered) reset now.
-    if not generation_ids:
-        _reset_book_status_if_settled(book_id, db)
+    _reset_book_status_if_settled(book_id, db)
 
     task_id = str(uuid.uuid4())
     return task_id, total
@@ -809,6 +874,90 @@ def _reset_book_status_if_settled(book_id: str, db: Session) -> None:
             db.commit()
 
 
+def settle_cancelled_book_generation(generation_id: str, db: Session) -> None:
+    """Settle book rows even when a queued job never entered its coroutine."""
+    from .. import database
+    from . import book_events
+
+    segments = db.query(database.BookSegment).filter_by(generation_id=generation_id).all()
+    books = set()
+    chapters = set()
+    for segment in segments:
+        if segment.audio_status in {"pending", "generating"}:
+            segment.audio_status = "error"
+        chapter = db.get(database.Chapter, segment.chapter_id)
+        if chapter is not None:
+            chapters.add(chapter.id)
+            books.add(chapter.book_id)
+    if not segments:
+        return
+    db.commit()
+    for chapter_id in chapters:
+        _reflow_chapter_story_times(chapter_id, db)
+    for book_id in books:
+        _publish_progress_and_drain(book_id, db, book_events)
+
+
+def _recover_failed_materialization(book_id: str, db: Session) -> None:
+    """Rollback a failed chapter and settle earlier committed, unqueued chapters."""
+    from .. import database
+
+    db.rollback()
+    pending = db.query(database.BookSegment).join(database.Chapter).filter(
+        database.Chapter.book_id == book_id,
+        database.BookSegment.audio_status.in_({"pending", "generating"}),
+    ).all()
+    for segment in pending:
+        segment.audio_status = "error"
+        generation = db.get(database.Generation, segment.generation_id) if segment.generation_id else None
+        if generation is not None and generation.status in {"pending", "loading_model", "generating"}:
+            generation.status = "failed"
+            generation.error = "章节任务创建失败，请重试"
+    db.commit()
+    _reset_book_status_if_settled(book_id, db)
+
+
+def _claim_book_generation(book, db):
+    from fastapi import HTTPException
+
+    from .. import database
+
+    changed = db.query(database.Book).filter(database.Book.id == book.id, database.Book.status == book.status).update({"status": "generating"}, synchronize_session=False)
+    db.commit()
+    if not changed:
+        raise HTTPException(status_code=409, detail="这本书的任务状态已变化，请刷新后重试")
+
+
+def _preflight_generation(book, db, chapter_ids, engine):
+    from fastapi import HTTPException
+
+    from .. import database
+    from .profiles import validate_profile_engine
+
+    if book.status in {"analyzing", "exporting"}:
+        raise HTTPException(status_code=409, detail="请等待当前分析或导出完成")
+    chapter_query = db.query(database.Chapter.id).filter_by(book_id=book.id)
+    known = {row[0] for row in chapter_query.all()}
+    if chapter_ids is not None and (not chapter_ids or not set(chapter_ids) <= known):
+        raise HTTPException(status_code=400, detail="请选择属于本书的有效章节")
+    segments = db.query(database.BookSegment).join(database.Chapter).filter(database.Chapter.book_id == book.id)
+    if chapter_ids is not None:
+        segments = segments.filter(database.BookSegment.chapter_id.in_(chapter_ids))
+    if not segments.count():
+        raise HTTPException(status_code=409, detail="尚无朗读片段，请先分析小说")
+    profiles = db.query(database.VoiceProfile).join(database.BookCharacter, database.BookCharacter.profile_id == database.VoiceProfile.id).filter(database.BookCharacter.book_id == book.id).all()
+    profile_by_id = {profile.id: profile for profile in profiles}
+    character_profiles = dict(db.query(database.BookCharacter.id, database.BookCharacter.profile_id).filter_by(book_id=book.id).all())
+    for character_id, in segments.with_entities(database.BookSegment.character_id).distinct():
+        profile = profile_by_id.get(character_profiles.get(character_id))
+        if profile is None:
+            raise HTTPException(status_code=422, detail="存在未绑定声音的角色，请先分配角色声音")
+        try:
+            validate_profile_engine(profile, engine or _resolve_engine_for_profile(profile.id, db))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 def _resolve_profile_id(segment, db) -> Optional[str]:
     """Return the VoiceProfile id for a segment's assigned character."""
     from .. import database
@@ -831,10 +980,11 @@ def _resolve_engine_for_profile(profile_id: str, db) -> str:
     if profile is None:
         return _DEFAULT_ENGINE
 
+    fallback = {"cloned": "qwen", "designed": "breeze"}.get(profile.voice_type, _DEFAULT_ENGINE)
     return (
         getattr(profile, "default_engine", None)
         or getattr(profile, "preset_engine", None)
-        or _DEFAULT_ENGINE
+        or fallback
     )
 
 
@@ -847,6 +997,7 @@ def _mark_generation_error(generation_id: str, error: str, db) -> None:
         if gen is not None:
             gen.status = "failed"
             gen.error = error
+            db.query(database.BookSegment).filter_by(generation_id=generation_id).update({"audio_status": "error"})
             db.commit()
     except Exception:
         logger.exception("Failed to mark generation %s as error", generation_id)

@@ -20,6 +20,7 @@ import { useBooksStore } from '@/stores/booksStore';
 // via spy call-count matchers on first-party hook layers.
 const mergeCalls: Array<{ bookId: string; charId: string; data: { source_char_id: string } }> = [];
 const deleteCalls: Array<{ bookId: string; charId: string }> = [];
+const bookGenerateCalls: Array<{ bookId: string; data?: unknown }> = [];
 const generateCalls: Array<{ bookId: string; chapterId: string; data?: unknown }> = [];
 
 // Per-test overrides for what the mocked HTTP boundary returns.
@@ -48,6 +49,8 @@ const baseBook = {
 
 vi.mock('@/lib/api/client', () => ({
   apiClient: {
+    getGenerationStatus: vi.fn(async () => ({ chapters: [], overall_progress: 0 })),
+    generateBook: vi.fn(async (bookId: string, data?: unknown) => { bookGenerateCalls.push({ bookId, data }); return { task_id: 'book-task', queued_segments: 4 }; }),
     getBook: vi.fn(async (_id: string) => baseBook),
     getCharacters: vi.fn(async (_id: string) => apiState.characters),
     mergeCharacter: vi.fn(async (bookId: string, charId: string, data: { source_char_id: string }) => {
@@ -134,12 +137,37 @@ describe('BookOverview', () => {
     mergeCalls.length = 0;
     deleteCalls.length = 0;
     generateCalls.length = 0;
+    bookGenerateCalls.length = 0;
     apiState.characters = [...defaultCharacters];
     apiState.generateChapterImpl = null;
     mockProgressHandlers = {};
     // Reset the real store and prime selectedBookId so queries enable
     useBooksStore.getState().reset();
     useBooksStore.getState().setSelectedBookId('b1');
+  });
+
+
+  it('queues selected chapters with the requested chapter concurrency', async () => {
+    await renderOverview();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select chapter 2' }));
+    fireEvent.change(screen.getByLabelText('Concurrent chapters'), { target: { value: '3' } });
+    fireEvent.click(screen.getByTestId('generate-selected-btn'));
+    await waitFor(() => expect(bookGenerateCalls).toEqual([{ bookId: 'b1', data: { chapter_ids: ['c2'], concurrency: 3, overwrite_errors: true } }]));
+  });
+
+  it('queues the whole book with the default concurrency', async () => {
+    await renderOverview();
+    fireEvent.click(screen.getByTestId('generate-all-btn'));
+    await waitFor(() => expect(bookGenerateCalls).toEqual([{ bookId: 'b1', data: { chapter_ids: undefined, concurrency: 2, overwrite_errors: true } }]));
+  });
+
+  it('requests chapter playback when the playable chapter button is used', async () => {
+    await renderOverview();
+    act(() => mockProgressHandlers.onGenerationComplete?.({ type: 'generation_complete', chapter_id: 'c1' }));
+    fireEvent.click(await screen.findByTestId('play-chapter-1'));
+    expect(useBooksStore.getState().selectedChapterId).toBe('c1');
+    expect(useBooksStore.getState().playbackChapterRequest).toBe('c1');
+    expect(useBooksStore.getState().view).toBe('chapter-editor');
   });
 
   // ── Book header ──────────────────────────────────────────────────────────
@@ -676,7 +704,7 @@ describe('BookOverview', () => {
     });
     await waitFor(() => {
       // The aria-label exposes a "play" affordance for the first chapter row.
-      expect(screen.getByLabelText('play-chapter-1')).toBeInTheDocument();
+      expect(screen.getByTestId('play-chapter-1')).toBeInTheDocument();
     });
   });
 

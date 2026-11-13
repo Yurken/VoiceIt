@@ -73,7 +73,7 @@ def patch_character(
 
 @router.get("/books/{book_id}/voice-options", response_model=VoiceOptionsResponse)
 def get_voice_options(book_id: str, db: Session = Depends(get_db)):
-    """Return voice picker sources: library profiles, book profiles, and Kokoro presets."""
+    """Return voice picker sources: library profiles, book profiles, and Qwen speakers."""
     try:
         return svc.get_voice_options(book_id, db)
     except ValueError as exc:
@@ -124,6 +124,7 @@ async def preview_character(
             profile_id=data.profile_id,
             preset_voice_id=data.preset_voice_id,
             design_prompt=data.design_prompt,
+            prompt_id=data.prompt_id,
             emotion=data.emotion,
         )
         return PreviewResponse(**result)

@@ -823,3 +823,52 @@ def test_preview_instruct_matches_generation_compose_instruct(temp_db, generated
     # And it must NOT be the old mangled 'Speak with a … tone.' wrapping.
     assert "Speak with a" not in (captured["instruct"] or "")
     assert captured["emotion"] is None  # composed instruct passed verbatim, not as emotion
+
+
+def test_regenerate_uses_current_text_role_binding_stable_seed_and_age_stage(temp_db, generated_book, monkeypatch):
+    import backend.database as database
+    import backend.services.generation as generation_service
+    import backend.services.task_queue as queue
+    from backend.services.book_generation import stable_voice_seed
+    from backend.services.book_regenerate import regenerate_segment
+
+    profile = VoiceProfile(name="新绑定角色声线", voice_type="preset", preset_engine="qwen_custom_voice",
+                           preset_voice_id="Serena", default_engine="qwen_custom_voice")
+    temp_db.add(profile)
+    temp_db.flush()
+    character = BookCharacter(book_id=generated_book["book_id"], name="林青", profile_id=profile.id)
+    temp_db.add(character)
+    temp_db.flush()
+    segment = temp_db.get(BookSegment, generated_book["seg1_id"])
+    segment.character_id = character.id
+    segment.text = "修改后的中文台词。"
+    segment.voice_stage = "少年"
+    temp_db.commit()
+    captured = {}
+    pending_inner = []
+
+    def capture_generation(**kwargs):
+        captured.update(kwargs)
+        async def no_op():
+            return None
+        pending_inner.append(no_op())
+        return pending_inner[-1]
+
+    def close_queued(_generation_id, coroutine):
+        # The worker is outside this service test; don't run the completion hook.
+        pending_inner[-1].close()
+        coroutine.close()
+
+    monkeypatch.setattr(generation_service, "run_generation", capture_generation)
+    monkeypatch.setattr(queue, "enqueue_generation", close_queued)
+    regenerate_segment(segment.id, emotion="surprised", db=temp_db)
+    assert captured["profile_id"] == profile.id
+    assert captured["engine"] == "qwen_custom_voice"
+    assert captured["text"] == "修改后的中文台词。"
+    assert captured["language"] == "zh"
+    assert captured["seed"] == stable_voice_seed(profile.id)
+    assert "少年" in captured["instruct"]
+    assert "surprised" in captured["instruct"]
+    persisted = temp_db.get(database.Generation, generated_book["gen1_id"])
+    assert persisted.profile_id == profile.id
+    assert persisted.text == segment.text

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001, RUF003
 """Tests for POST /books/{id}/analyze (B4).
 
 Tests:
@@ -36,7 +37,7 @@ def _epub_bytes() -> bytes:
     b.add_author("Hugh Howey")
 
     chapter = epub.EpubHtml(title="Chapter 1", file_name="c1.xhtml")
-    chapter.content = "<p>Dark night of the soul. \"Help me,\" said Holston. \"No,\" said Allison.</p>"
+    chapter.content = '<p>Dark night of the soul. "Help me," said Holston. "No," said Allison.</p>'
     b.add_item(chapter)
 
     b.spine = ["nav", chapter]
@@ -52,13 +53,17 @@ def _make_fake_book_analysis(character_names: list[str]):
     """Build a BookAnalysis-like object with given character names."""
     from backend.services.literary_analysis import BookAnalysis, ChapterAnalysis
 
-    characters = [
-        {"name": name, "dialogue_count": 2, "confidence": 0.9}
-        for name in character_names
-    ]
+    characters = [{"name": name, "dialogue_count": 2, "confidence": 0.9} for name in character_names]
     segments = [
         {"type": "narration", "text": "Dark night.", "order": 0, "speaker": None, "emotion": None, "intensity": None},
-        {"type": "dialogue", "text": "Help me.", "order": 1, "speaker": character_names[0], "emotion": None, "intensity": None},
+        {
+            "type": "dialogue",
+            "text": "Help me.",
+            "order": 1,
+            "speaker": character_names[0],
+            "emotion": None,
+            "intensity": None,
+        },
     ]
     chapter = ChapterAnalysis(segments=segments, characters=characters, flagged=False)
     return BookAnalysis(chapters=[chapter], characters=characters)
@@ -105,13 +110,14 @@ def client(engine_and_session, tmp_path, monkeypatch):
     # Point the data dir at tmp_path so cover files go somewhere writable
     monkeypatch.setenv("VOICEIT_DATA_DIR", str(tmp_path))
     import backend.config as _cfg
+
     _cfg._data_dir = tmp_path
 
     # Prevent the background task from running actual analysis in route tests.
     # We mock enqueue_analysis to just flip the status without starting a real task.
     import backend.services.book_analysis as ba_svc
 
-    def mock_enqueue(book_id, model_size, narrator_voice_id):
+    def mock_enqueue(book_id, model_size, narrator_voice_id, **kwargs):
         """Flip status synchronously, return a fake task_id, don't run pipeline."""
         db = TestSession()
         try:
@@ -227,15 +233,13 @@ def test_analyze_empty_body_accepted(client, book_id):
 
 
 @pytest.mark.asyncio
-async def test_materialization_creates_rows_and_emits_events(
-    temp_db, seeded_book_id, monkeypatch
-):
+async def test_materialization_creates_rows_and_emits_events(temp_db, seeded_book_id, monkeypatch):
     """run_analysis_task creates BookCharacter+BookSegment rows and emits events in order."""
     from backend.services import book_analysis, book_events, literary_analysis, voice_casting
 
     fake_analysis = _make_fake_book_analysis(["Holston", "Allison"])
 
-    async def fake_analyze_book(chapters, model_size=None, progress_cb=None):
+    async def fake_analyze_book(chapters, model_size=None, progress_cb=None, **kwargs):
         return fake_analysis
 
     monkeypatch.setattr(literary_analysis, "analyze_book", fake_analyze_book)
@@ -244,9 +248,7 @@ async def test_materialization_creates_rows_and_emits_events(
     seen = []
     monkeypatch.setattr(book_events, "publish", lambda bid, p: seen.append(p))
 
-    await book_analysis.run_analysis_task(
-        seeded_book_id, model_size="1.7B", db=temp_db
-    )
+    await book_analysis.run_analysis_task(seeded_book_id, model_size="1.7B", db=temp_db)
 
     # Characters: 2 named + 1 narrator = at least 3
     char_count = temp_db.query(BookCharacter).filter_by(book_id=seeded_book_id).count()
@@ -263,8 +265,7 @@ async def test_materialization_creates_rows_and_emits_events(
     first_detected_idx = types.index("character_detected")
     complete_idx = types.index("analysis_complete")
     assert first_detected_idx < complete_idx, (
-        f"character_detected (idx {first_detected_idx}) must come before "
-        f"analysis_complete (idx {complete_idx})"
+        f"character_detected (idx {first_detected_idx}) must come before analysis_complete (idx {complete_idx})"
     )
 
     # Book status should be "analyzed" on success
@@ -274,15 +275,13 @@ async def test_materialization_creates_rows_and_emits_events(
 
 
 @pytest.mark.asyncio
-async def test_materialization_emits_analysis_progress_events(
-    temp_db, seeded_book_id, monkeypatch
-):
+async def test_materialization_emits_analysis_progress_events(temp_db, seeded_book_id, monkeypatch):
     """run_analysis_task emits analysis_progress events at key stages."""
     from backend.services import book_analysis, book_events, literary_analysis, voice_casting
 
     fake_analysis = _make_fake_book_analysis(["Holston"])
 
-    async def fake_analyze_book(chapters, model_size=None, progress_cb=None):
+    async def fake_analyze_book(chapters, model_size=None, progress_cb=None, **kwargs):
         return fake_analysis
 
     monkeypatch.setattr(literary_analysis, "analyze_book", fake_analyze_book)
@@ -291,24 +290,18 @@ async def test_materialization_emits_analysis_progress_events(
     seen = []
     monkeypatch.setattr(book_events, "publish", lambda bid, p: seen.append(p))
 
-    await book_analysis.run_analysis_task(
-        seeded_book_id, model_size="1.7B", db=temp_db
-    )
+    await book_analysis.run_analysis_task(seeded_book_id, model_size="1.7B", db=temp_db)
 
-    progress_stages = [
-        p.get("stage") for p in seen if p.get("type") == "analysis_progress"
-    ]
+    progress_stages = [p.get("stage") for p in seen if p.get("type") == "analysis_progress"]
     assert len(progress_stages) >= 1, "Expected at least one analysis_progress event"
 
 
 @pytest.mark.asyncio
-async def test_error_flips_status_and_emits_error_event(
-    temp_db, seeded_book_id, monkeypatch
-):
+async def test_error_flips_status_and_emits_error_event(temp_db, seeded_book_id, monkeypatch):
     """run_analysis_task flips status=error and emits an error event on failure."""
     from backend.services import book_analysis, book_events, literary_analysis
 
-    async def failing_analyze(chapters, model_size=None):
+    async def failing_analyze(chapters, model_size=None, **kwargs):
         raise RuntimeError("LLM exploded")
 
     monkeypatch.setattr(literary_analysis, "analyze_book", failing_analyze)
@@ -316,9 +309,7 @@ async def test_error_flips_status_and_emits_error_event(
     seen = []
     monkeypatch.setattr(book_events, "publish", lambda bid, p: seen.append(p))
 
-    await book_analysis.run_analysis_task(
-        seeded_book_id, model_size="1.7B", db=temp_db
-    )
+    await book_analysis.run_analysis_task(seeded_book_id, model_size="1.7B", db=temp_db)
 
     book = temp_db.query(Book).filter_by(id=seeded_book_id).first()
     assert book.status == "error"
@@ -332,9 +323,7 @@ async def test_error_flips_status_and_emits_error_event(
 # ---------------------------------------------------------------------------
 
 
-def test_enqueue_analysis_flips_status_and_returns_task_id(
-    engine_and_session, monkeypatch
-):
+def test_enqueue_analysis_flips_status_and_returns_task_id(engine_and_session, monkeypatch, tmp_path):
     """enqueue_analysis flips book.status to 'analyzing' and returns a non-empty task_id.
 
     Calls enqueue_analysis directly with:
@@ -345,6 +334,9 @@ def test_enqueue_analysis_flips_status_and_returns_task_id(
     import backend.database as db_module
     import backend.services.task_queue as tq_module
     from backend.services import book_analysis as ba_svc
+    import backend.config as cfg
+
+    monkeypatch.setattr(cfg, "_data_dir", tmp_path)
 
     _, TestSession = engine_and_session
 
@@ -382,18 +374,14 @@ def test_enqueue_analysis_flips_status_and_returns_task_id(
     task_id = ba_svc.enqueue_analysis(book_id, "1.7B", "auto")
 
     # Assert: task_id is a non-empty string
-    assert isinstance(task_id, str) and len(task_id) > 0, (
-        f"Expected non-empty task_id string, got {task_id!r}"
-    )
+    assert isinstance(task_id, str) and len(task_id) > 0, f"Expected non-empty task_id string, got {task_id!r}"
 
     # Assert: book.status is now "analyzing" in the DB
     verify_db = TestSession()
     try:
         refreshed = verify_db.query(Book).filter_by(id=book_id).first()
         assert refreshed is not None, "Book disappeared from DB"
-        assert refreshed.status == "analyzing", (
-            f"Expected status='analyzing', got {refreshed.status!r}"
-        )
+        assert refreshed.status == "analyzing", f"Expected status='analyzing', got {refreshed.status!r}"
     finally:
         verify_db.close()
 
@@ -404,9 +392,7 @@ def test_enqueue_analysis_flips_status_and_returns_task_id(
 
 
 @pytest.mark.asyncio
-async def test_integration_major_gets_designed_minor_gets_preset(
-    temp_db, seeded_book_id, monkeypatch
-):
+async def test_integration_all_roles_get_playable_qwen_profiles(temp_db, seeded_book_id, monkeypatch):
     """Integration: run_analysis_task with real cast_book (not mocked).
 
     A major character (role='major', vocal_description set) must receive a
@@ -462,22 +448,21 @@ async def test_integration_major_gets_designed_minor_gets_preset(
         characters=[major_char, minor_char],
     )
 
-    async def fake_analyze_book(chapters, model_size=None, progress_cb=None):
+    async def fake_analyze_book(chapters, model_size=None, progress_cb=None, **kwargs):
         return fake_analysis
 
     monkeypatch.setattr(literary_analysis, "analyze_book", fake_analyze_book)
 
     # Mock the Kokoro preset pool so cast_book can assign a preset to Allison
     import backend.services.voice_casting as vc_module
-    monkeypatch.setattr(vc_module, "_get_preset_ids", lambda engine: ["af_heart", "af_sky"])
+
+    monkeypatch.setattr(vc_module, "_get_preset_ids", lambda engine: ["Vivian", "Ryan", "Serena"])
 
     # Suppress SSE publish noise
     monkeypatch.setattr(book_events, "publish", lambda bid, p: None)
 
     # Run with REAL cast_book (not mocked)
-    await book_analysis.run_analysis_task(
-        seeded_book_id, model_size="1.7B", db=temp_db, narrator_voice_id="auto"
-    )
+    await book_analysis.run_analysis_task(seeded_book_id, model_size="1.7B", db=temp_db, narrator_voice_id="auto")
 
     # Retrieve materialized characters
     chars = temp_db.query(BookCharacter).filter_by(book_id=seeded_book_id).all()
@@ -498,14 +483,14 @@ async def test_integration_major_gets_designed_minor_gets_preset(
     assert holston.profile_id is not None, "Holston has no profile_id"
     holston_profile = temp_db.get(VoiceProfile, holston.profile_id)
     assert holston_profile is not None, "Holston's VoiceProfile not found"
-    assert holston_profile.voice_type == "designed", (
-        f"Expected Holston voice_type='designed', got {holston_profile.voice_type!r}"
-    )
+    assert holston_profile.voice_type == "preset"
+    assert holston_profile.preset_engine == "qwen_custom_voice"
 
     # Minor must get a preset VoiceProfile (language="en" → Kokoro eligible)
     assert allison.profile_id is not None, "Allison has no profile_id"
     allison_profile = temp_db.get(VoiceProfile, allison.profile_id)
     assert allison_profile is not None, "Allison's VoiceProfile not found"
+    assert allison_profile.preset_engine == "qwen_custom_voice"
     assert allison_profile.voice_type == "preset", (
         f"Expected Allison voice_type='preset', got {allison_profile.voice_type!r}"
     )
@@ -517,23 +502,22 @@ async def test_integration_major_gets_designed_minor_gets_preset(
 
 
 @pytest.mark.asyncio
-async def test_narrator_voice_id_applied_before_casting(
-    temp_db, seeded_book_id, monkeypatch
-):
+async def test_narrator_voice_id_applied_before_casting(temp_db, seeded_book_id, monkeypatch):
     """When narrator_voice_id is a real profile id, the narrator gets that profile."""
     from backend.database import VoiceProfile
     from backend.services import book_analysis, book_events, literary_analysis
 
     fake_analysis = _make_fake_book_analysis(["Holston"])
 
-    async def fake_analyze_book(chapters, model_size=None, progress_cb=None):
+    async def fake_analyze_book(chapters, model_size=None, progress_cb=None, **kwargs):
         return fake_analysis
 
     monkeypatch.setattr(literary_analysis, "analyze_book", fake_analyze_book)
     monkeypatch.setattr(book_events, "publish", lambda bid, p: None)
 
     import backend.services.voice_casting as vc_module
-    monkeypatch.setattr(vc_module, "_get_preset_ids", lambda engine: ["af_heart"])
+
+    monkeypatch.setattr(vc_module, "_get_preset_ids", lambda engine: ["Vivian", "Ryan", "Serena"])
 
     # Seed a pre-existing voice profile to use as narrator_voice_id
     narrator_profile = VoiceProfile(
@@ -558,15 +542,10 @@ async def test_narrator_voice_id_applied_before_casting(
     )
 
     # The narrator character should have the pre-assigned profile
-    narrator_char = (
-        temp_db.query(BookCharacter)
-        .filter_by(book_id=seeded_book_id, is_narrator=True)
-        .first()
-    )
+    narrator_char = temp_db.query(BookCharacter).filter_by(book_id=seeded_book_id, is_narrator=True).first()
     assert narrator_char is not None
     assert narrator_char.profile_id == narrator_profile_id, (
-        f"Expected narrator profile_id={narrator_profile_id!r}, "
-        f"got {narrator_char.profile_id!r}"
+        f"Expected narrator profile_id={narrator_profile_id!r}, got {narrator_char.profile_id!r}"
     )
 
 
@@ -576,9 +555,7 @@ async def test_narrator_voice_id_applied_before_casting(
 
 
 @pytest.mark.asyncio
-async def test_materialization_recounts_dialogue_from_segments(
-    temp_db, seeded_book_id, monkeypatch
-):
+async def test_materialization_recounts_dialogue_from_segments(temp_db, seeded_book_id, monkeypatch):
     """After materialization, dialogue_count reflects real BookSegment rows.
 
     The narrator has both narration and dialogue segments assigned to it
@@ -590,37 +567,282 @@ async def test_materialization_recounts_dialogue_from_segments(
 
     fake_analysis = _make_fake_book_analysis(["Holston"])
 
-    async def fake_analyze_book(chapters, model_size=None, progress_cb=None):
+    async def fake_analyze_book(chapters, model_size=None, progress_cb=None, **kwargs):
         return fake_analysis
 
     monkeypatch.setattr(literary_analysis, "analyze_book", fake_analyze_book)
     monkeypatch.setattr(book_events, "publish", lambda bid, p: None)
 
     import backend.services.voice_casting as vc_module
-    monkeypatch.setattr(vc_module, "_get_preset_ids", lambda engine: ["af_heart"])
+
+    monkeypatch.setattr(vc_module, "_get_preset_ids", lambda engine: ["Vivian", "Ryan", "Serena"])
     monkeypatch.setattr(vc_module, "cast_book", lambda *a, **k: None)
 
-    await book_analysis.run_analysis_task(
-        seeded_book_id, model_size="1.7B", db=temp_db
-    )
+    await book_analysis.run_analysis_task(seeded_book_id, model_size="1.7B", db=temp_db)
 
-    narrator = (
-        temp_db.query(BookCharacter)
-        .filter_by(book_id=seeded_book_id, is_narrator=True)
-        .first()
-    )
+    narrator = temp_db.query(BookCharacter).filter_by(book_id=seeded_book_id, is_narrator=True).first()
     assert narrator is not None
 
     # Count segments actually assigned to the narrator in the DB
-    actual_seg_count = (
-        temp_db.query(BookSegment)
-        .filter(BookSegment.character_id == narrator.id)
-        .count()
-    )
+    actual_seg_count = temp_db.query(BookSegment).filter(BookSegment.character_id == narrator.id).count()
 
     # The narrator's dialogue_count should equal its total segment count
     # (because _recount_dialogue for is_narrator=True counts all segments)
     assert narrator.dialogue_count == actual_seg_count, (
-        f"Narrator dialogue_count={narrator.dialogue_count} but has "
-        f"{actual_seg_count} segments in DB"
+        f"Narrator dialogue_count={narrator.dialogue_count} but has {actual_seg_count} segments in DB"
     )
+
+
+def test_txt_import_retains_uploaded_chinese_filename(client):
+    response = client.post(
+        "/books/import", files={"file": ("长夜里的回声.txt", "第一章 夜雨\n林默说：“你好。”".encode(), "text/plain")}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["title"] == "长夜里的回声"
+    assert body["chapter_count"] == 1
+    assert body["chapters"][0]["title"] == "第一章 夜雨"
+
+
+def test_empty_novel_is_rejected_without_creating_analyzed_shell(client):
+    response = client.post("/books/import", files={"file": ("空书.txt", b"\n  \n", "text/plain")})
+    assert response.status_code == 400
+    assert "正文" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_preserves_alias_identity_voice_binding_and_replaces_segments(
+    temp_db, seeded_book_id, monkeypatch
+):
+    from backend.database import VoiceProfile
+    from backend.services import book_analysis, book_events, literary_analysis, voice_casting
+
+    profile = VoiceProfile(
+        name="林默固定声线",
+        voice_type="preset",
+        preset_engine="qwen_custom_voice",
+        preset_voice_id="Ryan",
+        default_engine="qwen_custom_voice",
+    )
+    temp_db.add(profile)
+    temp_db.flush()
+    original = BookCharacter(
+        book_id=seeded_book_id, name="霍尔斯顿", aliases=["Holston"], profile_id=profile.id, is_narrator=False
+    )
+    temp_db.add(original)
+    temp_db.commit()
+    identity, binding = original.id, original.profile_id
+    result = _make_fake_book_analysis(["Holston"])
+    result.chapters[0].segments[1].update(voice_stage="中年", delivery="轻声", analysis_metadata={"voice_stage_evidence": "四十五岁"})
+
+    async def fake_analysis(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(literary_analysis, "analyze_book", fake_analysis)
+    monkeypatch.setattr(voice_casting, "cast_book", lambda *args, **kwargs: None)
+    monkeypatch.setattr(book_events, "publish", lambda *args: None)
+    for _ in range(2):
+        await book_analysis.run_analysis_task(seeded_book_id, db=temp_db)
+    chars = temp_db.query(BookCharacter).filter_by(book_id=seeded_book_id).all()
+    assert len(chars) == 2
+    named = next(c for c in chars if not c.is_narrator)
+    assert (named.id, named.profile_id) == (identity, binding)
+    assert "霍尔斯顿" in named.aliases
+    segments = temp_db.query(BookSegment).all()
+    assert len(segments) == 2
+    dialogue = next(s for s in segments if s.type == "dialogue")
+    assert dialogue.character_id == identity
+    assert dialogue.voice_stage == "中年"
+    assert dialogue.delivery == "轻声"
+    assert dialogue.analysis_metadata["voice_stage_evidence"] == "四十五岁"
+
+
+@pytest.mark.asyncio
+async def test_empty_analysis_result_preserves_whole_chapter_and_warns(temp_db, seeded_book_id, monkeypatch):
+    from backend.services import book_analysis, book_events, literary_analysis, voice_casting
+    from backend.services.literary_analysis import BookAnalysis, ChapterAnalysis
+
+    async def empty(*args, **kwargs):
+        return BookAnalysis([ChapterAnalysis([], [])], [])
+
+    monkeypatch.setattr(literary_analysis, "analyze_book", empty)
+    monkeypatch.setattr(voice_casting, "cast_book", lambda *args, **kwargs: None)
+    events = []
+    monkeypatch.setattr(book_events, "publish", lambda book, event: events.append(event))
+    await book_analysis.run_analysis_task(seeded_book_id, db=temp_db)
+    segment = temp_db.query(BookSegment).one()
+    assert segment.text == temp_db.query(Chapter).one().raw_text
+    assert segment.flagged
+    assert temp_db.query(BookCharacter).count() == 1
+    completion = next(e for e in events if e["type"] == "analysis_complete")
+    assert completion["flagged_chapters"] == 1
+    assert completion["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_completed_chapter_checkpoint_survives_later_analysis_failure(
+    temp_db, seeded_book_id, monkeypatch, tmp_path
+):
+    import json
+    import backend.config as cfg
+    from backend.services import book_analysis, book_events, literary_analysis
+    from backend.services.literary_analysis import ChapterAnalysis
+
+    monkeypatch.setattr(cfg, "_data_dir", tmp_path)
+
+    async def later_failure(chapters, *, checkpoint_cb, **kwargs):
+        checkpoint_cb(0, ChapterAnalysis([{"type": "narration", "text": chapters[0], "order": 0}], []))
+        raise RuntimeError("后续章节模型加载失败")
+
+    monkeypatch.setattr(literary_analysis, "analyze_book", later_failure)
+    monkeypatch.setattr(book_events, "publish", lambda *args: None)
+    await book_analysis.run_analysis_task(seeded_book_id, db=temp_db)
+    chapter = temp_db.query(Chapter).one()
+    path = tmp_path / "analysis" / seeded_book_id / f"{chapter.id}.json"
+    saved = json.loads(path.read_text())
+    assert saved["source_sha256"]
+    assert saved["analysis"]["segments"][0]["text"] == chapter.raw_text
+    assert temp_db.get(Book, seeded_book_id).status == "error"
+
+
+def test_startup_recovery_releases_orphaned_analyzing_status(temp_db, seeded_book_id):
+    from backend.services.book_analysis import recover_interrupted_analyses
+
+    book = temp_db.get(Book, seeded_book_id)
+    book.status = "analyzing"
+    temp_db.commit()
+    assert recover_interrupted_analyses(temp_db) == 1
+    temp_db.refresh(book)
+    assert book.status == "error"
+
+
+def test_legacy_giant_chapter_is_repaired_with_original_backup(temp_db, seeded_book_id, monkeypatch, tmp_path):
+    import json
+    import backend.config as cfg
+    from backend.services.book_analysis import repair_legacy_book_chapters
+    from backend.services.ingestion import MAX_CHAPTER_CHARS
+
+    monkeypatch.setattr(cfg, "_data_dir", tmp_path)
+    chapter = temp_db.query(Chapter).one()
+    original_id = chapter.id
+    text = (
+        "第0章 新书感言\r\n这是前言。\r\n第一章 夜雨\r\n"
+        + "林默在雨夜回家。" * 6000
+        + "\r\n第2章 重逢\r\n多年后，他终于回来了。"
+    )
+    chapter.raw_text = text
+    chapter.word_count = 3
+    temp_db.get(Book, seeded_book_id).status = "analyzed"
+    temp_db.commit()
+    count = repair_legacy_book_chapters(temp_db, seeded_book_id)
+    chapters = temp_db.query(Chapter).order_by(Chapter.number).all()
+    assert count == len(chapters) > 3
+    assert chapters[0].id == original_id
+    assert max(len(c.raw_text) for c in chapters) <= MAX_CHAPTER_CHARS
+    assert "".join(c.raw_text for c in chapters).replace("\n", "") == text.replace("\r\n", "")
+    assert temp_db.get(Book, seeded_book_id).status == "imported"
+    backup = json.loads((tmp_path / "analysis" / seeded_book_id / "source-before-repair.json").read_text())
+    assert backup["chapters"][0]["raw_text"] == text
+    assert repair_legacy_book_chapters(temp_db, seeded_book_id) == 0
+
+
+def test_legacy_repair_leaves_existing_segments_untouched(temp_db, seeded_book_id):
+    from backend.services.book_analysis import repair_legacy_book_chapters
+
+    chapter = temp_db.query(Chapter).one()
+    temp_db.add(BookSegment(chapter_id=chapter.id, text="用户已编辑的片段", order=0))
+    temp_db.commit()
+    assert repair_legacy_book_chapters(temp_db, seeded_book_id) == 0
+    assert temp_db.query(BookSegment).one().text == "用户已编辑的片段"
+
+
+@pytest.mark.asyncio
+async def test_error_retry_reads_unchanged_chapter_checkpoint_without_model(
+    temp_db, seeded_book_id, monkeypatch, tmp_path
+):
+    import backend.config as cfg
+    from backend.services import book_analysis, book_events, literary_analysis, voice_casting
+    from backend.services.literary_analysis import ChapterAnalysis
+
+    monkeypatch.setattr(cfg, "_data_dir", tmp_path)
+    original_analyze = literary_analysis.analyze_book
+
+    async def saved_then_failed(chapters, *, checkpoint_cb, **kwargs):
+        checkpoint_cb(
+            0,
+            ChapterAnalysis(
+                [
+                    {
+                        "type": "narration",
+                        "text": chapters[0],
+                        "order": 0,
+                        "speaker": None,
+                        "voice_stage": None,
+                        "analysis_metadata": {"method": "saved_for_resume"},
+                    }
+                ],
+                [],
+            ),
+        )
+        raise RuntimeError("后续分析中断")
+
+    monkeypatch.setattr(literary_analysis, "analyze_book", saved_then_failed)
+    monkeypatch.setattr(book_events, "publish", lambda *args: None)
+    monkeypatch.setattr(voice_casting, "cast_book", lambda *args, **kwargs: None)
+    await book_analysis.run_analysis_task(seeded_book_id, db=temp_db)
+    assert temp_db.get(Book, seeded_book_id).status == "error"
+    monkeypatch.setattr(literary_analysis, "analyze_book", original_analyze)
+
+    async def no_model(*args, **kwargs):
+        raise AssertionError("恢复的完整章不应重新分析")
+
+    monkeypatch.setattr(literary_analysis, "generate_structured", no_model)
+    await book_analysis.run_analysis_task(seeded_book_id, db=temp_db, resume=True)
+    assert temp_db.get(Book, seeded_book_id).status == "analyzed"
+    segment = temp_db.query(BookSegment).one()
+    assert segment.analysis_metadata["method"] == "saved_for_resume"
+    assert segment.text == temp_db.query(Chapter).one().raw_text
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_cleans_derived_story_links_but_preserves_audio_history(temp_db, seeded_book_id, monkeypatch):
+    from backend.database import Generation, Story, StoryItem, VoiceProfile
+    from backend.services import book_analysis, book_events, literary_analysis, voice_casting
+
+    profile = VoiceProfile(
+        name="旧章角色", voice_type="preset", preset_engine="qwen_custom_voice", preset_voice_id="Ryan"
+    )
+    chapter_story, other_story = Story(name="旧章音轨"), Story(name="用户的其他作品")
+    temp_db.add_all([profile, chapter_story, other_story])
+    temp_db.flush()
+    old = Generation(profile_id=profile.id, text="旧版正文", audio_path="audio/old.wav", status="completed")
+    unrelated = Generation(
+        profile_id=profile.id, text="用户手动添加的片头", audio_path="audio/intro.wav", status="completed"
+    )
+    temp_db.add_all([old, unrelated])
+    temp_db.flush()
+    chapter = temp_db.query(Chapter).one()
+    chapter.story_id = chapter_story.id
+    old_segment = BookSegment(
+        chapter_id=chapter.id, order=0, text="旧版正文", generation_id=old.id, audio_status="completed"
+    )
+    old_link = StoryItem(story_id=chapter_story.id, generation_id=old.id)
+    other_link = StoryItem(story_id=other_story.id, generation_id=old.id)
+    manual_link = StoryItem(story_id=chapter_story.id, generation_id=unrelated.id)
+    temp_db.add_all([old_segment, old_link, other_link, manual_link])
+    temp_db.commit()
+    old_generation_id, old_link_id, other_link_id, manual_link_id = old.id, old_link.id, other_link.id, manual_link.id
+
+    async def analyzed(*args, **kwargs):
+        return _make_fake_book_analysis(["Holston"])
+
+    monkeypatch.setattr(literary_analysis, "analyze_book", analyzed)
+    monkeypatch.setattr(voice_casting, "cast_book", lambda *args, **kwargs: None)
+    monkeypatch.setattr(book_events, "publish", lambda *args: None)
+    await book_analysis.run_analysis_task(seeded_book_id, db=temp_db)
+    assert temp_db.get(Book, seeded_book_id).status == "analyzed"
+    assert temp_db.get(StoryItem, old_link_id) is None
+    assert temp_db.get(StoryItem, other_link_id) is not None
+    assert temp_db.get(StoryItem, manual_link_id) is not None
+    assert temp_db.get(Generation, old_generation_id).audio_path == "audio/old.wav"
+    assert temp_db.query(BookSegment).count() == 2

@@ -16,17 +16,21 @@ Languages supported: zh, en, ja, ko, de, fr, ru, pt, es, it
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
 import torch
 
-from . import TTSBackend, LANGUAGE_CODE_TO_NAME
+from ..utils.hf_offline_patch import force_offline_if_cached
+from . import LANGUAGE_CODE_TO_NAME, QWEN_CUSTOM_VOICE_MLX_REPOS, QWEN_CUSTOM_VOICE_MLX_REQUIRED_FILES
 from .base import (
-    is_model_cached,
-    get_torch_device,
     combine_voice_prompts as _combine_voice_prompts,
+    find_cached_model_snapshot,
+    get_torch_device,
+    is_model_cached,
     model_load_progress,
+    run_pinned,
 )
 
 logger = logging.getLogger(__name__)
@@ -212,3 +216,88 @@ class QwenCustomVoiceBackend:
 
         audio, sample_rate = await asyncio.to_thread(_generate_sync)
         return audio, sample_rate
+
+
+class MLXQwenCustomVoiceBackend(QwenCustomVoiceBackend):
+    """CustomVoice on Apple Silicon, using the MLX quantized checkpoints."""
+
+    def __init__(self, model_size: str = "1.7B"):
+        self.model = None
+        self.model_size = model_size
+        self._current_model_size: str | None = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-custom-voice")
+
+    def _get_model_path(self, model_size: str) -> str:
+        if model_size not in QWEN_CUSTOM_VOICE_MLX_REPOS:
+            raise ValueError(f"Unknown model size: {model_size}")
+        return QWEN_CUSTOM_VOICE_MLX_REPOS[model_size]
+
+    def _is_model_cached(self, model_size: str | None = None) -> bool:
+        return find_cached_model_snapshot(
+            self._get_model_path(model_size or self.model_size), QWEN_CUSTOM_VOICE_MLX_REQUIRED_FILES
+        ) is not None
+
+    async def load_model_async(self, model_size: str | None = None) -> None:
+        await run_pinned(self._executor, self._load_model_sync, model_size or self.model_size)
+
+    load_model = load_model_async
+
+    def _load_model_sync(self, model_size: str) -> None:
+        # Check on the pinned worker so simultaneous requests only load once.
+        if self.model is not None and self._current_model_size == model_size:
+            return
+
+        from mlx_audio.tts import load
+
+        repo_id = self._get_model_path(model_size)
+        cached_path = find_cached_model_snapshot(repo_id, QWEN_CUSTOM_VOICE_MLX_REQUIRED_FILES)
+        is_cached = cached_path is not None
+        model_path = cached_path if is_cached else repo_id
+        if self.model is not None:
+            self.unload_model()
+
+        with model_load_progress(f"qwen-custom-voice-{model_size}", is_cached), force_offline_if_cached(is_cached, repo_id):
+            self.model = load(model_path)
+
+        self._current_model_size = model_size
+        self.model_size = model_size
+        logger.info("Loaded MLX CustomVoice %s from %s", model_size, model_path)
+
+    def unload_model(self) -> None:
+        self.model = None
+        self._current_model_size = None
+
+    async def generate(
+        self,
+        text: str,
+        voice_prompt: dict,
+        language: str = "en",
+        seed: int | None = None,
+        instruct: str | None = None,
+    ) -> tuple[np.ndarray, int]:
+        await self.load_model_async(None)
+        speaker = voice_prompt.get("preset_voice_id") or QWEN_CV_DEFAULT_SPEAKER
+
+        def _generate_sync():
+            if seed is not None:
+                import mlx.core as mx
+
+                mx.random.seed(seed)
+
+            chunks = []
+            sample_rate = 24000
+            with force_offline_if_cached(self._is_model_cached(), self._get_model_path(self.model_size)):
+                for result in self.model.generate_custom_voice(
+                    text=text,
+                    speaker=speaker,
+                    language=LANGUAGE_CODE_TO_NAME.get(language, "auto"),
+                    instruct=instruct,
+                ):
+                    chunks.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
+                    sample_rate = result.sample_rate
+
+            if not chunks or not any(chunk.size for chunk in chunks):
+                raise RuntimeError("MLX CustomVoice returned no audio")
+            return np.concatenate(chunks), sample_rate
+
+        return await run_pinned(self._executor, _generate_sync)

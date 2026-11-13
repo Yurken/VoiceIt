@@ -239,7 +239,7 @@ async def cancel_generation(generation_id: str, db: Session = Depends(get_db)):
     if not gen:
         raise HTTPException(status_code=404, detail="Generation not found")
 
-    if (gen.status or "completed") not in ("loading_model", "generating"):
+    if (gen.status or "completed") not in ("pending", "loading_model", "generating"):
         raise HTTPException(status_code=400, detail="Only active generations can be cancelled")
 
     cancellation_state = cancel_generation_job(generation_id)
@@ -256,6 +256,9 @@ async def cancel_generation(generation_id: str, db: Session = Depends(get_db)):
             db=db,
             error="Generation orphaned by worker",
         )
+        from ..services.book_generation import settle_cancelled_book_generation
+
+        settle_cancelled_book_generation(generation_id, db)
         return {"message": "Orphaned generation cleared"}
 
     if cancellation_state == "queued":
@@ -267,6 +270,9 @@ async def cancel_generation(generation_id: str, db: Session = Depends(get_db)):
             db=db,
             error="Generation cancelled",
         )
+        from ..services.book_generation import settle_cancelled_book_generation
+
+        settle_cancelled_book_generation(generation_id, db)
         return {"message": "Queued generation cancelled"}
 
     return {"message": "Generation cancellation requested"}

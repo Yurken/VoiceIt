@@ -1,51 +1,39 @@
-"""Hybrid voice casting — designed leads/narrator, preset minors, distinctiveness.
+"""Stable, playable Qwen casting for an entire book.
 
-Assigns VoiceProfile rows to BookCharacter rows for a given book:
-- Leads (major role) and narrators get a *designed* VoiceProfile whose
-  design_prompt comes from the character's vocal_description.
-- Minors get a *preset* VoiceProfile drawn from the Kokoro pool, provided
-  the book language is in KOKORO_LANGS.  If the pool is exhausted or the
-  language is not supported, minors also get a designed profile.
-
-A **distinctiveness check** ensures co-occurring speakers never share the
-same (voice_type, preset_voice_id, design_prompt) key.
-
-All created profiles have book_id set and is_library=False.  Names are
-collision-safe: "<character> — <title>" with " (2)", " (3)" … suffixes.
+A character keeps one profile across chapters.  Casting reuses installed Qwen
+preset profiles, respects existing assignments, and chooses a matching speaker
+before reusing one when the finite preset inventory is exhausted.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from datetime import datetime
-from typing import Callable
 
 from sqlalchemy.orm import Session
 
 from ..database import Book, BookCharacter, VoiceProfile
 
-# Languages covered by the Kokoro preset pool
-KOKORO_LANGS = {"en", "zh", "ja", "es", "fr", "hi", "it", "pt"}
+logger = logging.getLogger(__name__)
+DEFAULT_ENGINE = "qwen_custom_voice"
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers — replaceable in tests via monkeypatch
-# ---------------------------------------------------------------------------
 
 def _get_preset_ids(engine: str) -> list[str]:
-    """Return sorted list of preset voice ids for *engine*.
-
-    This thin wrapper is the single seam that tests can monkeypatch.
-    Production code delegates to profiles._get_preset_voice_ids which reads
-    the real backend — no hardcoded list here.
-    """
     from . import profiles as profiles_service
 
     return sorted(profiles_service._get_preset_voice_ids(engine))
 
 
+def get_qwen_voices() -> list[tuple]:
+    """Return the backend's real (id, name, gender, language, description) inventory."""
+    from ..backends.qwen_custom_voice_backend import QWEN_CUSTOM_VOICES
+
+    return list(QWEN_CUSTOM_VOICES)
+
+
 def _unique_name(base: str, db: Session) -> str:
-    """Return *base* if available in the DB, else probe "<base> (2)", " (3)" …"""
     name = base
     n = 1
     while db.query(VoiceProfile).filter_by(name=name).first() is not None:
@@ -54,56 +42,73 @@ def _unique_name(base: str, db: Session) -> str:
     return name
 
 
-def _conflicts(
-    cid: str,
-    key: tuple,
-    used_keys: dict[str, tuple],
-    cooccurrence: set[tuple],
-) -> bool:
-    """Return True if assigning *key* to *cid* would collide with a co-occurring speaker."""
-    for other_id, other_key in used_keys.items():
-        if other_key == key:
-            pair1 = (cid, other_id)
-            pair2 = (other_id, cid)
-            if pair1 in cooccurrence or pair2 in cooccurrence:
-                return True
-    return False
+def _gender(character: BookCharacter, prompt: str = "") -> str | None:
+    gender = (character.gender or "").strip().lower()
+    if gender in {"female", "woman", "girl", "女", "女性"}:
+        return "female"
+    if gender in {"male", "man", "boy", "男", "男性"}:
+        return "male"
+    if re.search(r"female|woman|girl|女", prompt, re.I):
+        return "female"
+    if re.search(r"\bmale\b|\bman\b|\bboy\b|男", prompt, re.I):
+        return "male"
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Profile creation helpers (no async — no TTS)
-# ---------------------------------------------------------------------------
-
-def create_designed_profile(
+def choose_voice_id(
     character: BookCharacter,
-    book: Book,
-    prompt: str,
-    db: Session,
-) -> VoiceProfile:
-    """Create and flush a *designed* VoiceProfile for *character* in *book*.
+    *,
+    language: str = "zh",
+    prompt: str = "",
+    used: dict[str, str] | None = None,
+    cooccurrence: set[tuple[str, str]] | None = None,
+) -> str:
+    """Choose deterministically from playable Qwen speakers using character traits.
 
-    The profile has book_id=book.id and is_library=False; name is
-    collision-safe via ``_unique_name``.  Callers must call db.commit()
-    themselves after any downstream assignments.
+    Matching gender takes priority; within that group narrator separation,
+    scene distinctness and inventory usage are considered before timbre traits.
+    Reuse is intentional for large casts: CustomVoice has nine speaker identities.
     """
-    name = _unique_name(f"{character.name} — {book.title}", db)
-    profile = VoiceProfile(
-        id=str(uuid.uuid4()),
-        name=name,
-        voice_type="designed",
-        design_prompt=prompt,
-        book_id=book.id,
-        is_library=False,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
-    )
-    db.add(profile)
-    db.flush()
-    return profile
+    inventory = set(_get_preset_ids(DEFAULT_ENGINE))
+    voices = [voice for voice in get_qwen_voices() if voice[0] in inventory]
+    if not voices:
+        raise ValueError("400:没有可用的 Qwen 内置声音，请先在声音档案中启用 Qwen CustomVoice")
+    used = used or {}
+    cooccurrence = cooccurrence or set()
+    traits = " ".join(filter(None, [prompt, character.vocal_description, character.archetype, character.age_range])).lower()
+    gender = _gender(character, traits)
+    old = bool(re.search(r"elder|old|senior|aged|老年|年迈|苍老|沧桑|中老年", traits))
+    ages = [int(n) for n in re.findall(r"\d+", character.age_range or "")]
+    old = old or bool(ages and min(ages) >= 55)
+    warm = bool(re.search(r"warm|gentle|soft|温柔|温暖|柔和|沉稳|低沉|醇厚", traits))
+    bright = bool(re.search(r"bright|lively|energetic|活泼|明亮|开朗|清脆|俏皮", traits))
 
+    def score(voice: tuple) -> tuple[int, str]:
+        voice_id, _name, voice_gender, native_language, _description = voice
+        value = 0
+        if gender and voice_gender != gender:
+            value += 1000
+        # Keep the narrator audibly separate even without an explicit scene edge.
+        matches = [cid for cid, vid in used.items() if vid == voice_id]
+        value += len(matches) * 40
+        for cid in matches:
+            if character.is_narrator or (character.id, cid) in cooccurrence or (cid, character.id) in cooccurrence:
+                value += 100
+        if native_language != language:
+            value += 12
+        if character.is_narrator and voice_id == ("Uncle_Fu" if language == "zh" else "Ryan"):
+            value -= 20
+        if old and voice_id == "Uncle_Fu":
+            value -= 25
+        if warm and voice_id in {"Serena", "Uncle_Fu", "Sohee"}:
+            value -= 15
+        if bright and voice_id in {"Vivian", "Eric", "Aiden", "Ono_Anna"}:
+            value -= 15
+        if not old and voice_id == "Uncle_Fu" and not character.is_narrator:
+            value += 6
+        return value, voice_id
 
-# Backward-compat alias — internal callers inside this module use this name.
-_create_designed_profile = create_designed_profile
+    return min(voices, key=score)[0]
 
 
 def create_preset_profile(
@@ -112,19 +117,18 @@ def create_preset_profile(
     voice_id: str,
     db: Session,
 ) -> VoiceProfile:
-    """Create and flush a *preset* (Kokoro) VoiceProfile for *character* in *book*.
-
-    The profile has book_id=book.id, is_library=False, preset_engine="kokoro".
-    Callers must call db.commit() themselves after any downstream assignments.
-    """
-    name = _unique_name(f"{character.name} — {book.title}", db)
+    """Create a book-owned, playable Qwen profile for a selected speaker."""
+    if voice_id not in _get_preset_ids(DEFAULT_ENGINE):
+        raise ValueError("400:未知的 Qwen 内置声音")
     profile = VoiceProfile(
         id=str(uuid.uuid4()),
-        name=name,
+        name=_unique_name(f"{character.name} — {book.title}", db),
+        description=character.vocal_description,
+        language="zh",
         voice_type="preset",
-        preset_engine="kokoro",
+        preset_engine=DEFAULT_ENGINE,
         preset_voice_id=voice_id,
-        default_engine="kokoro",
+        default_engine=DEFAULT_ENGINE,
         book_id=book.id,
         is_library=False,
         created_at=datetime.utcnow(),
@@ -135,30 +139,46 @@ def create_preset_profile(
     return profile
 
 
-# Backward-compat alias — internal callers inside this module use this name.
+def create_designed_profile(
+    character: BookCharacter,
+    book: Book,
+    prompt: str,
+    db: Session,
+) -> VoiceProfile:
+    """Create an explicitly requested Breeze voice, separate from default casting."""
+    profile = VoiceProfile(
+        id=str(uuid.uuid4()),
+        name=_unique_name(f"{character.name} — {book.title}", db),
+        description=prompt,
+        language="zh",
+        voice_type="designed",
+        design_prompt=prompt,
+        default_engine="breeze",
+        book_id=book.id,
+        is_library=False,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(profile)
+    db.flush()
+    return profile
+
+
+_create_designed_profile = create_designed_profile
 _create_preset_profile = create_preset_profile
 
 
-def _pick_preset(
-    preset_pool: list[str],
-    character: BookCharacter,
-    cooccurrence: set[tuple],
-    used_keys: dict[str, tuple],
-) -> str | None:
-    """Return the first preset voice not in conflict with co-occurring speakers.
+def _existing_qwen_profile(voice_id: str, book_id: str, db: Session) -> VoiceProfile | None:
+    profiles = (
+        db.query(VoiceProfile)
+        .filter_by(voice_type="preset", preset_engine=DEFAULT_ENGINE, preset_voice_id=voice_id)
+        .all()
+    )
+    # Never borrow a private voice from another book. Existing global voices are
+    # valid library choices even if created before is_library was introduced.
+    profiles = [p for p in profiles if p.book_id is None or p.book_id == book_id]
+    return min(profiles, key=lambda p: (p.book_id is not None, not p.is_library, p.name, p.id), default=None)
 
-    Returns None when the pool is exhausted (caller must fall back to designed).
-    """
-    for voice_id in preset_pool:
-        key = ("preset", voice_id, None)
-        if not _conflicts(character.id, key, used_keys, cooccurrence):
-            return voice_id
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def cast_book(
     book_id: str,
@@ -166,82 +186,49 @@ def cast_book(
     cooccurrence: set[tuple[str, str]],
     language: str,
     db: Session,
+    voice_mode: str = "preset",
 ) -> None:
-    """Assign VoiceProfiles to all uncast BookCharacters for *book_id*.
-
-    Args:
-        book_id:      The book's primary key.
-        cooccurrence: Set of (char_id_a, char_id_b) pairs that appear in the
-                      same scene/chapter.  Order within each pair is arbitrary.
-        language:     ISO 639-1 language code of the book (e.g. "en", "sw").
-        db:           SQLAlchemy session.
-    """
+    """Cast unassigned characters once, preserving bindings on every later run."""
     book = db.get(Book, book_id)
     if book is None:
         raise ValueError(f"Book {book_id!r} not found")
+    characters = db.query(BookCharacter).filter_by(book_id=book_id).all()
+    used: dict[str, str] = {}
+    for character in characters:
+        profile = db.get(VoiceProfile, character.profile_id) if character.profile_id else None
+        if profile and profile.voice_type == "preset" and profile.preset_engine == DEFAULT_ENGINE:
+            used[character.id] = profile.preset_voice_id
+        elif character.profile_id and profile is None:
+            # A deleted voice must not leave a character silently unrenderable.
+            character.profile_id = None
 
-    chars = db.query(BookCharacter).filter_by(book_id=book_id).all()
-
-    # Load preset pool once — sorted for determinism
-    preset_pool = _get_preset_ids("kokoro")
-
-    # Map char_id -> distinctiveness key (voice_type, preset_voice_id, design_prompt)
-    used_keys: dict[str, tuple] = {}
-
-    # Seed used_keys with already-cast characters so distinctiveness accounts
-    # for profiles from a previous partial cast run.
-    for c in chars:
-        if c.profile_id:
-            prof = db.get(VoiceProfile, c.profile_id)
-            if prof is not None:
-                used_keys[c.id] = (prof.voice_type, prof.preset_voice_id, prof.design_prompt)
-
-    # Process characters from most-spoken to least so leads (high dialogue_count)
-    # get first pick and their designed voices anchor the distinctiveness space.
-    for c in sorted(chars, key=lambda x: -(x.dialogue_count or 0)):
-        if c.profile_id:
-            # Already cast (from a prior run or above seed) — keep it.
+    ordered = sorted(characters, key=lambda c: (not c.is_narrator, c.role != "major", -(c.dialogue_count or 0), c.name, c.id))
+    for character in ordered:
+        if character.profile_id:
             continue
+        if voice_mode == "designed":
+            from .voice_prompts import match_voice_prompt
 
-        is_lead = (c.role == "major") or bool(c.is_narrator)
-
-        if is_lead or language not in KOKORO_LANGS:
-            # --- Designed voice ---
-            prompt = c.vocal_description or f"a distinctive voice for {c.name}"
-
-            # If co-occurring lead shares the same raw prompt, append a nudge.
-            base_key = ("designed", None, prompt)
-            nudge = 0
-            key = base_key
-            while _conflicts(c.id, key, used_keys, cooccurrence):
-                nudge += 1
-                nudged_prompt = f"{prompt} [voice variant {nudge}]"
-                key = ("designed", None, nudged_prompt)
-            _, _, final_prompt = key
-
-            prof = _create_designed_profile(c, book, final_prompt, db)
-
-        else:
-            # --- Preset voice ---
-            voice_id = _pick_preset(preset_pool, c, cooccurrence, used_keys)
-
-            if voice_id is None:
-                # Pool exhausted for this co-occurrence group — fall back to designed.
-                prompt = c.vocal_description or f"a distinctive voice for {c.name}"
-                base_key = ("designed", None, prompt)
-                nudge = 0
-                key = base_key
-                while _conflicts(c.id, key, used_keys, cooccurrence):
-                    nudge += 1
-                    nudged_prompt = f"{prompt} [voice variant {nudge}]"
-                    key = ("designed", None, nudged_prompt)
-                _, _, final_prompt = key
-                prof = _create_designed_profile(c, book, final_prompt, db)
-            else:
-                key = ("preset", voice_id, None)
-                prof = _create_preset_profile(c, book, voice_id, db)
-
-        used_keys[c.id] = key
-        c.profile_id = prof.id
-
+            prompt = match_voice_prompt(
+                db,
+                gender=character.gender,
+                age_range=character.age_range,
+                description=character.vocal_description or "",
+                is_narrator=bool(character.is_narrator),
+            )
+            description = character.vocal_description or ""
+            design_prompt = "\n".join(filter(None, [prompt.prompt if prompt else None, description]))
+            if not design_prompt:
+                raise ValueError("400:未找到适合该角色的设计提示词，请先导入提示词库或填写角色声音描述")
+            profile = create_designed_profile(character, book, design_prompt, db)
+            character.profile_id = profile.id
+            continue
+        voice_id = choose_voice_id(character, language=language, used=used, cooccurrence=cooccurrence)
+        if voice_id in used.values():
+            logger.warning("书籍 %s 的角色 %s 复用 Qwen 声线 %s：匹配的内置声线数量有限", book.id, character.name, voice_id)
+        profile = _existing_qwen_profile(voice_id, book.id, db)
+        if profile is None:
+            profile = create_preset_profile(character, book, voice_id, db)
+        character.profile_id = profile.id
+        used[character.id] = voice_id
     db.commit()

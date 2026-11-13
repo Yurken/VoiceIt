@@ -1,3 +1,4 @@
+import '@/i18n';
 /**
  * SegmentRegenerateControl — focused unit tests for the per-line regenerate
  * menu item rendered by ChapterEditor's ⋯ SelectionDialog.
@@ -94,10 +95,10 @@ describe('SegmentRegenerateControl', () => {
     const btn = screen.getByTestId('regenerate-btn-s3');
     expect(btn).toBeDisabled();
     expect(btn).toHaveTextContent('Re-rendering');
-    expect(btn).toHaveAttribute('title', 'Re-rendering this line…');
+    expect(btn).toHaveAttribute('title', 'Re-rendering…');
     const spinner = screen.getByTestId('regenerate-spinner-s3');
     expect(spinner).toBeInTheDocument();
-    expect(spinner).toHaveAttribute('aria-label', 'Re-rendering');
+    expect(spinner).toHaveAttribute('aria-label', 'Re-rendering…');
   });
 
   it('renders a spinner when audioStatus is "pending"', () => {

@@ -44,6 +44,21 @@ WHISPER_HF_REPOS = {
     "turbo": "openai/whisper-large-v3-turbo",
 }
 
+QWEN_CUSTOM_VOICE_MLX_REPOS = {
+    "1.7B": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+    "0.6B": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+}
+
+QWEN_CUSTOM_VOICE_MLX_REQUIRED_FILES = [
+    "config.json",
+    "model.safetensors",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "speech_tokenizer/config.json",
+    "speech_tokenizer/model.safetensors",
+]
+
 
 @dataclass
 class ModelConfig:
@@ -58,6 +73,7 @@ class ModelConfig:
     needs_trim: bool = False
     supports_instruct: bool = False
     languages: list[str] = field(default_factory=lambda: ["en"])
+    required_files: list[str] | None = None
 
 
 @runtime_checkable
@@ -210,6 +226,7 @@ _llm_backends_lock = threading.Lock()
 TTS_ENGINES = {
     "qwen": "Qwen TTS",
     "qwen_custom_voice": "Qwen CustomVoice",
+    "breeze": "Breeze TTS 2",
     "luxtts": "LuxTTS",
     "chatterbox": "Chatterbox TTS",
     "chatterbox_turbo": "Chatterbox Turbo",
@@ -257,13 +274,15 @@ def _get_qwen_model_configs() -> list[ModelConfig]:
 
 
 def _get_qwen_custom_voice_configs() -> list[ModelConfig]:
-    """Return Qwen CustomVoice model configs."""
+    """Return CustomVoice checkpoints for the active inference backend."""
+    use_mlx = get_backend_type() == "mlx"
     return [
         ModelConfig(
             model_name="qwen-custom-voice-1.7B",
             display_name="Qwen CustomVoice 1.7B",
             engine="qwen_custom_voice",
-            hf_repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            hf_repo_id=QWEN_CUSTOM_VOICE_MLX_REPOS["1.7B"] if use_mlx else "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            required_files=QWEN_CUSTOM_VOICE_MLX_REQUIRED_FILES if use_mlx else None,
             model_size="1.7B",
             size_mb=3500,
             supports_instruct=True,
@@ -273,7 +292,8 @@ def _get_qwen_custom_voice_configs() -> list[ModelConfig]:
             model_name="qwen-custom-voice-0.6B",
             display_name="Qwen CustomVoice 0.6B",
             engine="qwen_custom_voice",
-            hf_repo_id="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            hf_repo_id=QWEN_CUSTOM_VOICE_MLX_REPOS["0.6B"] if use_mlx else "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            required_files=QWEN_CUSTOM_VOICE_MLX_REQUIRED_FILES if use_mlx else None,
             model_size="0.6B",
             size_mb=1200,
             supports_instruct=True,
@@ -287,7 +307,20 @@ def _get_non_qwen_tts_configs() -> list[ModelConfig]:
 
     These are static — no backend-type branching needed.
     """
+    from .breeze_backend import BREEZE_REQUIRED_FILES, breeze_model_dir
+
     return [
+        ModelConfig(
+            model_name="breeze-tts",
+            display_name="Breeze TTS 2（本地音色设计）",
+            engine="breeze",
+            hf_repo_id=str(breeze_model_dir()),
+            model_size="default",
+            size_mb=3740,
+            supports_instruct=True,
+            languages=["zh", "en"],
+            required_files=BREEZE_REQUIRED_FILES,
+        ),
         ModelConfig(
             model_name="luxtts",
             display_name="LuxTTS (Fast, CPU-friendly)",
@@ -684,6 +717,10 @@ def get_tts_backend_for_engine(engine: str) -> TTSBackend:
                 from .pytorch_backend import PyTorchTTSBackend
 
                 backend = PyTorchTTSBackend()
+        elif engine == "breeze":
+            from .breeze_backend import BreezeTTSBackend
+
+            backend = BreezeTTSBackend()
         elif engine == "luxtts":
             from .luxtts_backend import LuxTTSBackend
 
@@ -705,9 +742,14 @@ def get_tts_backend_for_engine(engine: str) -> TTSBackend:
 
             backend = KokoroTTSBackend()
         elif engine == "qwen_custom_voice":
-            from .qwen_custom_voice_backend import QwenCustomVoiceBackend
+            if get_backend_type() == "mlx":
+                from .qwen_custom_voice_backend import MLXQwenCustomVoiceBackend
 
-            backend = QwenCustomVoiceBackend()
+                backend = MLXQwenCustomVoiceBackend()
+            else:
+                from .qwen_custom_voice_backend import QwenCustomVoiceBackend
+
+                backend = QwenCustomVoiceBackend()
         else:
             raise ValueError(f"Unknown TTS engine: {engine}. Supported: {list(TTS_ENGINES.keys())}")
 

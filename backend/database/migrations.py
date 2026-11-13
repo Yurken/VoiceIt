@@ -48,10 +48,21 @@ def run_migrations(engine) -> None:
     _migrate_generation_versions(engine, inspector, tables)
     _migrate_capture_settings(engine, inspector, tables)
     _migrate_mcp_bindings(engine, inspector, tables)
+    _migrate_book_segments(engine, inspector, tables)
     _normalize_storage_paths(engine, tables)
 
 
 # -- helpers ---------------------------------------------------------------
+
+
+def _migrate_book_segments(engine, inspector, tables: set[str]) -> None:
+    if "book_segments" not in tables:
+        return
+    columns = _get_columns(inspector, "book_segments")
+    if "voice_stage" not in columns:
+        _add_column(engine, "book_segments", "voice_stage VARCHAR", "voice_stage")
+    if "analysis_metadata" not in columns:
+        _add_column(engine, "book_segments", "analysis_metadata JSON NOT NULL DEFAULT '{}'", "analysis_metadata")
 
 def _get_columns(inspector, table: str) -> set[str]:
     return {col["name"] for col in inspector.get_columns(table)}

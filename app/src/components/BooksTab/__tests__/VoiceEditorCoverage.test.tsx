@@ -137,7 +137,7 @@ describe('VoiceEditor — PreviewPlayer play/pause', () => {
 
   it('PreviewPlayer toggles from play (▶) to pause (⏸) after a click when audio is available', async () => {
     const u = userEvent.setup();
-    render(<VoiceEditor />);
+    render(<VoiceEditor initialTab="design" />);
     const player = screen.getByTestId('preview-player');
     const playBtn = player.querySelector('button') as HTMLButtonElement;
     expect(playBtn).not.toBeDisabled();
@@ -149,7 +149,7 @@ describe('VoiceEditor — PreviewPlayer play/pause', () => {
 
   it('PreviewPlayer toggles back from pause (⏸) to play (▶) on a second click', async () => {
     const u = userEvent.setup();
-    render(<VoiceEditor />);
+    render(<VoiceEditor initialTab="design" />);
     const player = screen.getByTestId('preview-player');
     const playBtn = player.querySelector('button') as HTMLButtonElement;
     await u.click(playBtn);

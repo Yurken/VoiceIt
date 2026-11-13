@@ -2,7 +2,7 @@
 Pydantic models for request/response validation.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Optional, List, Literal
 from datetime import datetime
 
@@ -10,6 +10,7 @@ from .utils.capture_chords import (
     default_push_to_talk_chord,
     default_toggle_to_talk_chord,
 )
+from .utils.voice_stages import normalize_voice_stage
 
 
 class VoiceProfileCreate(BaseModel):
@@ -83,7 +84,7 @@ class GenerationRequest(BaseModel):
     seed: Optional[int] = Field(None, ge=0)
     model_size: Optional[str] = Field(default="1.7B", pattern="^(1\\.7B|0\\.6B|1B|3B)$")
     instruct: Optional[str] = Field(None, max_length=500)
-    engine: Optional[str] = Field(default="qwen", pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$")
+    engine: Optional[str] = Field(default="qwen", pattern="^(qwen|qwen_custom_voice|breeze|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$")
     personality: bool = Field(
         default=False,
         description="When true and the profile has a personality prompt, the input text is rewritten in-character before TTS.",
@@ -312,7 +313,7 @@ class MCPClientBindingResponse(BaseModel):
     profile_id: Optional[str] = None
     default_engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$",
+        pattern="^(qwen|qwen_custom_voice|breeze|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$",
     )
     default_personality: bool = False
     last_seen_at: Optional[datetime] = None
@@ -328,7 +329,7 @@ class MCPClientBindingUpsert(BaseModel):
     profile_id: Optional[str] = None
     default_engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$",
+        pattern="^(qwen|qwen_custom_voice|breeze|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$",
     )
     default_personality: bool = False
 
@@ -347,7 +348,7 @@ class SpeakRequest(BaseModel):
     )
     engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$",
+        pattern="^(qwen|qwen_custom_voice|breeze|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$",
     )
     personality: Optional[bool] = Field(
         None,
@@ -811,6 +812,8 @@ class BookResponse(BaseModel):
     chapter_count: int
     created_at: datetime
     updated_at: datetime
+    export_filename: str | None = None
+    export_format: Literal["m4b", "mp3_single", "mp3_per_chapter"] | None = None
 
 
 class BookDetailResponse(BookResponse):
@@ -831,6 +834,7 @@ class AnalyzeRequest(BaseModel):
 
     model_size: Literal["0.6B", "1.7B", "4B"] | None = None
     narrator_voice_id: str | None = None  # "auto" | profile id
+    voice_mode: Literal["preset", "designed"] = "preset"
 
 
 class AnalyzeResponse(BaseModel):
@@ -874,6 +878,7 @@ class CharacterUpdate(BaseModel):
     color: str | None = None
     profile_id: str | None = None
     design_prompt: str | None = None
+    prompt_id: str | None = None
     preset_voice_id: str | None = None
     is_narrator: bool | None = None
 
@@ -914,6 +919,9 @@ class SegmentResponse(BaseModel):
     emotion: str | None = None
     emotion_intensity: float | None = None
     delivery: str | None = None
+    voice_stage: str | None = None
+    analysis_metadata: dict = {}
+    flagged: bool = False
     order: int
     audio: SegmentAudio
 
@@ -925,8 +933,20 @@ class SegmentUpdate(BaseModel):
     emotion: str | None = None
     emotion_intensity: float | None = None
     delivery: str | None = None
+    voice_stage: str | None = None
+    flagged: bool | None = None
     text: str | None = None
     type: Literal["dialogue", "narration"] | None = None
+
+    @field_validator("voice_stage", mode="before")
+    @classmethod
+    def broad_voice_stage(cls, value):
+        if value is None or isinstance(value, str) and not value.strip():
+            return None
+        stage = normalize_voice_stage(value)
+        if stage is None:
+            raise ValueError("请选择少年、青年、中年或老年")
+        return stage
 
 
 class SegmentSplitRequest(BaseModel):
@@ -949,6 +969,7 @@ class PreviewRequest(BaseModel):
     profile_id: str | None = None
     preset_voice_id: str | None = None
     design_prompt: str | None = None
+    prompt_id: str | None = None
 
 
 class PreviewResponse(BaseModel):
@@ -970,6 +991,23 @@ class VoiceProfileSummary(BaseModel):
     book_id: str | None = None
 
 
+class VoiceDesignPromptResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    category: str
+    description: str
+    prompt: str
+    sample_text: str
+    source: str
+    source_voice_id: str | None = None
+    source_url: str | None = None
+    gender: str | None = None
+    age_range: str | None = None
+    language: str
+
+
 class VoiceOptionsResponse(BaseModel):
     """Three-section voice picker payload. (Contract 02)"""
 
@@ -987,6 +1025,8 @@ class GenerateRequest(BaseModel):
     engine: str | None = None
     model_size: str | None = None
     overwrite_errors: bool = False
+    chapter_ids: list[str] | None = None
+    concurrency: int = Field(default=2, ge=1, le=4)
 
 
 class GenerateResponse(BaseModel):

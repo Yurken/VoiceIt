@@ -22,6 +22,7 @@ const generationSchema = z.object({
     .enum([
       'qwen',
       'qwen_custom_voice',
+      'breeze',
       'luxtts',
       'chatterbox',
       'chatterbox_turbo',
@@ -88,41 +89,45 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
     try {
       const engine = data.engine || 'qwen';
       const modelName =
-        engine === 'luxtts'
-          ? 'luxtts'
-          : engine === 'chatterbox'
-            ? 'chatterbox-tts'
-            : engine === 'chatterbox_turbo'
-              ? 'chatterbox-turbo'
-              : engine === 'tada'
-                ? data.modelSize === '3B'
-                  ? 'tada-3b-ml'
-                  : 'tada-1b'
-                : engine === 'kokoro'
-                  ? 'kokoro'
-                  : engine === 'qwen_custom_voice'
-                    ? `qwen-custom-voice-${data.modelSize}`
-                    : `qwen-tts-${data.modelSize}`;
+        engine === 'breeze'
+          ? 'breeze-tts'
+          : engine === 'luxtts'
+            ? 'luxtts'
+            : engine === 'chatterbox'
+              ? 'chatterbox-tts'
+              : engine === 'chatterbox_turbo'
+                ? 'chatterbox-turbo'
+                : engine === 'tada'
+                  ? data.modelSize === '3B'
+                    ? 'tada-3b-ml'
+                    : 'tada-1b'
+                  : engine === 'kokoro'
+                    ? 'kokoro'
+                    : engine === 'qwen_custom_voice'
+                      ? `qwen-custom-voice-${data.modelSize}`
+                      : `qwen-tts-${data.modelSize}`;
       const displayName =
-        engine === 'luxtts'
-          ? 'LuxTTS'
-          : engine === 'chatterbox'
-            ? 'Chatterbox TTS'
-            : engine === 'chatterbox_turbo'
-              ? 'Chatterbox Turbo'
-              : engine === 'tada'
-                ? data.modelSize === '3B'
-                  ? 'TADA 3B Multilingual'
-                  : 'TADA 1B'
-                : engine === 'kokoro'
-                  ? 'Kokoro 82M'
-                  : engine === 'qwen_custom_voice'
-                    ? data.modelSize === '1.7B'
-                      ? 'Qwen CustomVoice 1.7B'
-                      : 'Qwen CustomVoice 0.6B'
-                    : data.modelSize === '1.7B'
-                      ? 'Qwen TTS 1.7B'
-                      : 'Qwen TTS 0.6B';
+        engine === 'breeze'
+          ? 'Breeze TTS 2'
+          : engine === 'luxtts'
+            ? 'LuxTTS'
+            : engine === 'chatterbox'
+              ? 'Chatterbox TTS'
+              : engine === 'chatterbox_turbo'
+                ? 'Chatterbox Turbo'
+                : engine === 'tada'
+                  ? data.modelSize === '3B'
+                    ? 'TADA 3B Multilingual'
+                    : 'TADA 1B'
+                  : engine === 'kokoro'
+                    ? 'Kokoro 82M'
+                    : engine === 'qwen_custom_voice'
+                      ? data.modelSize === '1.7B'
+                        ? 'Qwen CustomVoice 1.7B'
+                        : 'Qwen CustomVoice 0.6B'
+                      : data.modelSize === '1.7B'
+                        ? 'Qwen TTS 1.7B'
+                        : 'Qwen TTS 0.6B';
 
       // Check if model needs downloading
       try {
@@ -139,9 +144,7 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
 
       const hasModelSizes =
         engine === 'qwen' || engine === 'qwen_custom_voice' || engine === 'tada';
-      // Only Qwen CustomVoice actually honors the instruct kwarg at model level.
-      // Base Qwen3-TTS accepts the kwarg but ignores it.
-      const supportsInstruct = engine === 'qwen_custom_voice';
+      const supportsInstruct = engine === 'qwen_custom_voice' || engine === 'breeze';
       const effectsChain = options.getEffectsChain?.();
       // This now returns immediately with status="generating"
       const result = await generation.mutateAsync({

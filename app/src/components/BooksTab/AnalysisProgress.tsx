@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { useBookProgress } from '@/lib/hooks/useBookProgress';
-import { useBook } from '@/lib/hooks/useBooks';
+import { useBook, useAnalyzeBook } from '@/lib/hooks/useBooks';
 import { cn } from '@/lib/utils/cn';
 import type {
   AnalysisCompleteEvent,
@@ -70,6 +70,7 @@ const STAGE_LABEL_KEYS: Record<AnalysisStage, string> = {
 export function AnalysisProgress() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const analyzeBook = useAnalyzeBook();
 
   const { selectedBookId, setView } = useBooksStore((s) => ({
     selectedBookId: s.selectedBookId,
@@ -80,7 +81,7 @@ export function AnalysisProgress() {
   const { data: book } = useBook(selectedBookId);
   const didResume = useRef(false);
   useEffect(() => {
-    if (!didResume.current && book?.status === 'analyzed') {
+    if (!didResume.current && ['analyzed', 'generating', 'completed'].includes(book?.status ?? '')) {
       didResume.current = true;
       setView('overview');
     }
@@ -91,10 +92,12 @@ export function AnalysisProgress() {
   const [detailMessage, setDetailMessage] = useState<string>('');
   const [liveCharacters, setLiveCharacters] = useState<LiveCharacter[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [connectionWarning, setConnectionWarning] = useState(false);
 
   // ─── SSE handlers ───────────────────────────────────────────────────────────
 
   const onAnalysisProgress = useCallback((event: AnalysisProgressEvent) => {
+    setConnectionWarning(false);
     const { stage, progress, message } = event;
     if (message) setDetailMessage(message);
 
@@ -138,8 +141,9 @@ export function AnalysisProgress() {
   );
 
   const onError = useCallback((event: BookErrorEvent) => {
+    if (event.stage === 'connection') { setConnectionWarning(true); return; }
     setError(event.message);
-  }, []);
+  }, [t]);
 
   useBookProgress(selectedBookId ?? '', {
     onAnalysisProgress,
@@ -151,9 +155,11 @@ export function AnalysisProgress() {
   // ─── Retry ──────────────────────────────────────────────────────────────────
   function handleRetry() {
     setError(null);
+    setConnectionWarning(false);
     setStages(initialStages());
     setDetailMessage('');
     setLiveCharacters([]);
+    if (selectedBookId) analyzeBook.mutate({ bookId: selectedBookId, opts: {} }, { onError: (err) => setError(err.message) });
   }
 
   // ─── Overall progress (average of active/done stages) ───────────────────────
@@ -173,17 +179,18 @@ export function AnalysisProgress() {
         <p className="text-sm text-muted-foreground mt-0.5">{t('books.analysis.subtitle')}</p>
       </div>
 
+      {connectionWarning && <p role="status" className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm">{t('books.analysis.connectionRetry')}</p>}
       {/* Error banner */}
       {error && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 p-4 flex items-center justify-between gap-4">
           <p className="text-sm text-destructive">{error}</p>
-          <Button size="sm" variant="outline" onClick={handleRetry}>
+          <Button size="sm" variant="outline" onClick={handleRetry} disabled={analyzeBook.isPending}>
             {t('books.analysis.retry')}
           </Button>
         </div>
       )}
 
-      <div className="flex gap-4 items-start">
+      <div className="flex flex-col md:flex-row gap-4 items-start">
         {/* Stage feed */}
         <Card className="flex-[2]" data-testid="analysis-steps">
           <CardContent className="p-4">

@@ -44,6 +44,9 @@ vi.mock('@/stores/booksStore', () => ({
 }));
 
 vi.mock('@/lib/hooks/useBooks', () => ({
+  useGenerateBook: () => ({ mutateAsync: vi.fn().mockResolvedValue(undefined), isPending: false }),
+  useBookGenerationStatus: () => ({ data: undefined }),
+  useAnalyzeBook: () => ({ mutate: vi.fn(), isPending: false }),
   useBook: () => ({
     data: {
       id: 'b1',

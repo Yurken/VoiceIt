@@ -88,7 +88,7 @@ vi.mock('@/lib/api/client', () => ({
 function renderEditor() {
   return render(
     <>
-      <VoiceEditor />
+      <VoiceEditor initialTab="design" />
       <Toaster />
     </>,
   );

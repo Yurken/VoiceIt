@@ -5,13 +5,14 @@ Implements the business logic for Contract 02 character endpoints.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime
-from typing import Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from ..database import Book, BookCharacter, Generation, VoiceProfile
+from ..database import Book, BookCharacter, VoiceProfile
 from ..models import (
     CharacterResponse,
     CharacterUpdate,
@@ -19,20 +20,18 @@ from ..models import (
     VoiceProfileSummary,
 )
 from ..services import voice_casting as vc
-from ..services.task_queue import enqueue_generation
 from ..services.generation import run_generation
+from ..services.task_queue import enqueue_generation
 from ..utils.tasks import get_task_manager
-
+from ..utils.voice_stages import normalize_voice_stage
 
 # ---------------------------------------------------------------------------
 # Internal helpers (thin seams for test monkeypatching)
 # ---------------------------------------------------------------------------
 
 
-def _get_kokoro_voices() -> set[tuple]:
-    """Return the set of Kokoro voice tuples (voice_id, name, gender, lang)."""
-    from ..backends.kokoro_backend import KOKORO_VOICES
-    return set(KOKORO_VOICES)
+def _get_qwen_voices() -> list[tuple]:
+    return vc.get_qwen_voices()
 
 
 def _unique_profile_name(base: str, db: Session) -> str:
@@ -78,7 +77,7 @@ def character_to_response(char: BookCharacter, db: Session) -> CharacterResponse
         is_narrator=bool(char.is_narrator),
         role=char.role,
         gender=char.gender,
-        age_range=char.age_range,
+        age_range=normalize_voice_stage(char.age_range),
         vocal_description=char.vocal_description,
         archetype=char.archetype,
         dialogue_count=char.dialogue_count or 0,
@@ -125,8 +124,8 @@ def update_character(
 
     Assignment modes (mutually exclusive):
       - profile_id     → assign existing profile directly
-      - design_prompt  → create a new designed profile and assign it
-      - preset_voice_id → create a new preset (Kokoro) profile and assign it
+      - design_prompt  → create an explicitly requested Breeze designed profile
+      - preset_voice_id → create a Qwen preset profile and assign it
 
     Other fields (name, color, is_narrator) may be updated independently.
 
@@ -141,10 +140,16 @@ def update_character(
         raise ValueError("404:character not found")
 
     # Enforce "exactly one of" constraint for voice-assignment fields
-    voice_fields = [data.profile_id, data.design_prompt, data.preset_voice_id]
+    prompt_id = getattr(data, "prompt_id", None)
+    voice_fields = [data.profile_id, data.design_prompt, data.preset_voice_id, prompt_id]
+    original_profile_id = char.profile_id
+    if book.status == "generating" and any(value is not None for value in voice_fields):
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=409, detail="正在生成朗读，请完成后再修改角色声音")
     if sum(1 for f in voice_fields if f is not None) > 1:
         raise ValueError(
-            "400:at most one of profile_id, design_prompt, preset_voice_id may be set"
+            "400:profile_id、design_prompt、preset_voice_id、prompt_id 只能选择一项"
         )
 
     # Simple field updates
@@ -163,15 +168,32 @@ def update_character(
             raise ValueError("400:profile not found")
         char.profile_id = data.profile_id
 
-    elif data.design_prompt is not None:
-        # Create a new designed profile and assign it (reuses voice_casting helper)
-        new_profile = vc.create_designed_profile(char, book, data.design_prompt, db)
+    elif data.design_prompt is not None or prompt_id is not None:
+        # Breeze is the explicit VoiceDesign path; default automatic casting
+        # continues to use the existing Qwen CustomVoice inventory.
+        prompt_text = data.design_prompt
+        if prompt_id is not None:
+            from .voice_prompts import get_prompt
+
+            prompt = get_prompt(db, prompt_id)
+            if prompt is None:
+                raise ValueError("400:声音设计提示词不存在")
+            prompt_text = prompt.prompt
+        new_profile = vc.create_designed_profile(char, book, prompt_text, db)
         char.profile_id = new_profile.id
 
     elif data.preset_voice_id is not None:
-        # Create a new Kokoro preset profile and assign it (reuses voice_casting helper)
+        # A manually chosen Qwen speaker remains fixed for every chapter.
         new_profile = vc.create_preset_profile(char, book, data.preset_voice_id, db)
         char.profile_id = new_profile.id
+
+    if char.profile_id != original_profile_id:
+        from ..database import BookSegment
+
+        db.query(BookSegment).filter(
+            BookSegment.character_id == char.id,
+            BookSegment.generation_id.isnot(None),
+        ).update({"audio_status": "stale"}, synchronize_session=False)
 
     db.commit()
     db.refresh(char)
@@ -186,9 +208,9 @@ def update_character(
 def get_voice_options(book_id: str, db: Session) -> VoiceOptionsResponse:
     """Return three-section voice picker payload for a book.
 
-    library  — profiles with is_library=True
+    library  — library profiles and existing global profiles
     book     — profiles with book_id == this book
-    presets  — all Kokoro preset voices (same shape as /profiles/presets/kokoro)
+    presets  — all Qwen CustomVoice speakers, with descriptions
 
     Raises ValueError with '404' sentinel if book not found.
     """
@@ -198,7 +220,8 @@ def get_voice_options(book_id: str, db: Session) -> VoiceOptionsResponse:
 
     library_profiles = (
         db.query(VoiceProfile)
-        .filter(VoiceProfile.is_library == True)  # noqa: E712
+        .filter(or_(VoiceProfile.is_library.is_(True), VoiceProfile.book_id.is_(None)))
+        .filter(~VoiceProfile.name.like("_preview_%"))
         .all()
     )
     book_profiles = (
@@ -207,21 +230,22 @@ def get_voice_options(book_id: str, db: Session) -> VoiceOptionsResponse:
         .all()
     )
 
-    # Kokoro presets — same shape the profiles route returns
-    kokoro_presets = [
+    qwen_presets = [
         {
             "voice_id": vid,
             "name": name,
             "gender": gender,
             "language": lang,
+            "description": description,
+            "engine": vc.DEFAULT_ENGINE,
         }
-        for vid, name, gender, lang in _get_kokoro_voices()
+        for vid, name, gender, lang, description in _get_qwen_voices()
     ]
 
     return VoiceOptionsResponse(
         library=[VoiceProfileSummary.model_validate(p) for p in library_profiles],
         book=[VoiceProfileSummary.model_validate(p) for p in book_profiles],
-        presets=kokoro_presets,
+        presets=qwen_presets,
     )
 
 
@@ -263,14 +287,46 @@ def save_character_to_library(char_id: str, db: Session) -> VoiceProfileSummary:
 # Preview
 # ---------------------------------------------------------------------------
 
-_PREVIEW_TEXT = "This is a preview of the character's voice."
+_PREVIEW_TEXT = "你好，这是我的声音。故事即将开始，请和我一起走进书中的世界。"
+
+
+def profile_engine(profile: VoiceProfile) -> str:
+    if profile.voice_type == "preset":
+        return profile.preset_engine or vc.DEFAULT_ENGINE
+    if profile.voice_type == "designed":
+        return profile.default_engine or "breeze"
+    return profile.default_engine or "qwen"
+
+
+async def _clean_finished_candidate_previews(char_id: str, keep_name: str, db: Session) -> None:
+    """Reap only this character's unused, finished candidates and their files."""
+    from ..database import BookSegment, Generation, StoryItem
+    from .history import delete_generation
+    from .profiles import delete_profile
+
+    prefix = f"_preview_{char_id}_"
+    candidates = db.query(VoiceProfile).filter(VoiceProfile.name.like(prefix + "%")).all()
+    for profile in candidates:
+        if not profile.name.startswith(prefix) or profile.name == keep_name:
+            continue
+        if db.query(BookCharacter).filter_by(profile_id=profile.id).first():
+            continue
+        generations = db.query(Generation).filter_by(profile_id=profile.id).all()
+        if any(g.status in {"pending", "queued", "generating", "processing"} or g.source != "book_preview" for g in generations):
+            continue
+        ids = [g.id for g in generations]
+        if ids and (db.query(BookSegment).filter(BookSegment.generation_id.in_(ids)).first() or db.query(StoryItem).filter(StoryItem.generation_id.in_(ids)).first()):
+            continue
+        for generation in generations:
+            await delete_generation(generation.id, db)
+        await delete_profile(profile.id, db)
 
 
 def _resolve_preview_profile(
     char: BookCharacter,
-    profile_id: Optional[str],
-    preset_voice_id: Optional[str],
-    design_prompt: Optional[str],
+    profile_id: str | None,
+    preset_voice_id: str | None,
+    design_prompt: str | None,
     db: Session,
 ) -> tuple[str, str, str]:
     """Resolve (effective_profile_id, engine, voice_type) for a preview request.
@@ -288,23 +344,17 @@ def _resolve_preview_profile(
         prof = db.get(VoiceProfile, profile_id)
         if prof is None:
             raise ValueError("404:preview profile not found")
-        engine = (
-            getattr(prof, "default_engine", None)
-            or getattr(prof, "preset_engine", None)
-            or "kokoro"
-        )
+        engine = profile_engine(prof)
         vt = getattr(prof, "voice_type", None) or "cloned"
-        if vt == "preset":
-            engine = getattr(prof, "preset_engine", None) or "kokoro"
         return prof.id, engine, vt
 
     if preset_voice_id is not None:
-        # Ephemeral preset — no profile row created; engine defaults to kokoro
-        return "_preset_" + preset_voice_id, "kokoro", "preset"
+        if preset_voice_id not in vc._get_preset_ids(vc.DEFAULT_ENGINE):
+            raise ValueError("400:未知的 Qwen 内置声音")
+        return "_preset_" + preset_voice_id, vc.DEFAULT_ENGINE, "preset"
 
     if design_prompt is not None:
-        # Ephemeral designed — no profile row created
-        return "_designed_" + design_prompt[:32], "qwen", "designed"
+        return "_designed_" + design_prompt[:32], "breeze", "designed"
 
     # Fallback: character's assigned voice
     if not char.profile_id:
@@ -312,27 +362,22 @@ def _resolve_preview_profile(
     prof = db.get(VoiceProfile, char.profile_id)
     if prof is None:
         raise ValueError("400:assigned profile not found")
-    engine = (
-        getattr(prof, "default_engine", None)
-        or getattr(prof, "preset_engine", None)
-        or "kokoro"
-    )
+    engine = profile_engine(prof)
     vt = getattr(prof, "voice_type", None) or "cloned"
-    if vt == "preset":
-        engine = getattr(prof, "preset_engine", None) or "kokoro"
     return prof.id, engine, vt
 
 
 async def preview_character_voice(
     char_id: str,
-    text: Optional[str],
+    text: str | None,
     db: Session,
     *,
-    profile_id: Optional[str] = None,
-    preset_voice_id: Optional[str] = None,
-    design_prompt: Optional[str] = None,
-    emotion: Optional[str] = None,
-    instruct: Optional[str] = None,
+    profile_id: str | None = None,
+    preset_voice_id: str | None = None,
+    design_prompt: str | None = None,
+    emotion: str | None = None,
+    instruct: str | None = None,
+    prompt_id: str | None = None,
 ) -> dict:
     """Synthesize a short preview clip through the serial TTS queue.
 
@@ -349,11 +394,22 @@ async def preview_character_voice(
     if char is None:
         raise ValueError("404:character not found")
 
-    effective_profile_id, engine, voice_type = _resolve_preview_profile(
+    if prompt_id is not None:
+        if any(value is not None for value in (profile_id, preset_voice_id, design_prompt)):
+            raise ValueError("400:每次试听只能指定一种声音来源")
+        from .voice_prompts import get_prompt
+
+        prompt = get_prompt(db, prompt_id)
+        if prompt is None:
+            raise ValueError("400:声音设计提示词不存在")
+        design_prompt = prompt.prompt
+
+    effective_profile_id, engine, _voice_type = _resolve_preview_profile(
         char, profile_id, preset_voice_id, design_prompt, db
     )
 
     preview_text = text or _PREVIEW_TEXT
+    language = "zh" if any("\u4e00" <= c <= "\u9fff" for c in preview_text) else "en"
     generation_id = str(uuid.uuid4())
 
     # A verbatim instruct (e.g. composed by the book pipeline's compose_instruct,
@@ -362,44 +418,35 @@ async def preview_character_voice(
     if instruct is None and emotion:
         instruct = f"Speak with a {emotion} tone."
 
-    # For ephemeral candidate previews (preset/designed without a real profile),
-    # always create a transient VoiceProfile from the candidate params regardless
-    # of whether the character already has an assigned profile.  This ensures the
-    # candidate voice — not the character's permanent assignment — drives synthesis.
+    # Reuse a stable candidate profile so repeated auditions share one reference
+    # and seed. The permanent character assignment remains untouched.
     is_ephemeral = effective_profile_id.startswith(("_preset_", "_designed_"))
 
     if is_ephemeral:
-        # Delete any existing _preview_* transient profiles for this character so
-        # they don't accumulate unboundedly.  (Full reaping after generation
-        # completion is a future enhancement; this keeps the count ≤ 1.)
-        existing_previews = (
-            db.query(VoiceProfile)
-            .filter(VoiceProfile.name.like("_preview_%"))
-            .all()
-        )
-        # Only delete profiles not referenced by any other character
-        # (safe: _preview_* profiles are only ever created here)
-        for ep in existing_previews:
-            db.delete(ep)
-        db.flush()
-
-        # Create a transient profile that carries the candidate voice params
-        if preset_voice_id is not None:
+        candidate_hash = hashlib.sha256(f"{engine}:{preset_voice_id or design_prompt}".encode()).hexdigest()[:16]
+        candidate_name = f"_preview_{char.id}_{candidate_hash}"
+        await _clean_finished_candidate_previews(char.id, candidate_name, db)
+        tmp_profile = db.query(VoiceProfile).filter_by(name=candidate_name).first()
+        if tmp_profile is None and preset_voice_id is not None:
             tmp_profile = VoiceProfile(
-                id=str(uuid.uuid4()),
-                name=f"_preview_{generation_id}",
+                id=str(uuid.uuid5(uuid.NAMESPACE_URL, candidate_name)),
+                name=candidate_name,
+                language="zh",
                 voice_type="preset",
-                preset_engine="kokoro",
+                preset_engine=vc.DEFAULT_ENGINE,
                 preset_voice_id=preset_voice_id,
-                default_engine="kokoro",
+                default_engine=vc.DEFAULT_ENGINE,
                 is_library=False,
             )
-        else:
+        elif tmp_profile is None:
             tmp_profile = VoiceProfile(
-                id=str(uuid.uuid4()),
-                name=f"_preview_{generation_id}",
+                id=str(uuid.uuid5(uuid.NAMESPACE_URL, candidate_name)),
+                name=candidate_name,
+                language="zh",
                 voice_type="designed",
                 design_prompt=design_prompt,
+                default_engine="breeze",
+                description=design_prompt,
                 is_library=False,
             )
         db.add(tmp_profile)
@@ -414,7 +461,8 @@ async def preview_character_voice(
         id=generation_id,
         profile_id=gen_profile_id,
         text=preview_text,
-        language="en",
+        language=language,
+        engine=engine,
         audio_path="",
         duration=0,
         status="generating",
@@ -433,14 +481,16 @@ async def preview_character_voice(
     )
 
     # Build generation params — for ephemeral candidates override profile fields
+    from .book_generation import stable_voice_seed
+
     gen_kwargs: dict = dict(
         generation_id=generation_id,
         profile_id=gen_profile_id,
         text=preview_text,
-        language="en",
+        language=language,
         engine=engine,
         model_size=None,
-        seed=None,
+        seed=stable_voice_seed(gen_profile_id),
         normalize=True,
         instruct=instruct,
         mode="generate",

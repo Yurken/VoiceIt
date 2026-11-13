@@ -9,6 +9,21 @@ import { ProfileCard } from '@/components/VoiceProfiles/ProfileCard';
 import type { VoiceProfileResponse } from '@/lib/api/types';
 import { useUIStore } from '@/stores/uiStore';
 
+// Install storage before the persisted store is imported. Node 26 exposes a
+// localStorage getter that returns undefined without --localstorage-file;
+// Zustand would capture that value instead of jsdom's browser storage.
+const testStorage = vi.hoisted(() => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); },
+    removeItem: (key: string) => { values.delete(key); },
+    clear: () => { values.clear(); },
+  };
+  vi.stubGlobal('localStorage', storage);
+  return storage;
+});
+
 // ── apiClient mock ────────────────────────────────────────────────────────────
 // Drive the real useDeleteProfile / useExportProfile hooks through a faked
 // HTTP boundary instead of mocking the hooks themselves. This keeps the test
@@ -88,6 +103,7 @@ function resetUIStore() {
 }
 
 beforeEach(() => {
+  testStorage.clear();
   resetUIStore();
   deleteProfileFn.mockClear();
   exportProfileFn.mockClear();

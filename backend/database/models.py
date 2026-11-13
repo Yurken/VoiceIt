@@ -361,8 +361,30 @@ class BookSegment(Base):
     emotion = Column(String, nullable=True)
     emotion_intensity = Column(Float, nullable=True)
     delivery = Column(Text, nullable=True)  # free-text instruct, e.g. "through gritted teeth"
+    voice_stage = Column(String, nullable=True)
+    analysis_metadata = Column(JSON, nullable=False, default=dict)
     flagged = Column(Boolean, nullable=False, default=False)  # low-confidence triage
     generation_id = Column(String, ForeignKey("generations.id"), nullable=True)
     # none | pending | generating | completed | error | stale
     audio_status = Column(String, nullable=False, default="none")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class VoiceDesignPrompt(Base):
+    """Reusable voice descriptions, with their original source and sample text."""
+
+    __tablename__ = "voice_design_prompts"
+
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False, index=True)
+    category = Column(String, nullable=False, default="", index=True)
+    description = Column(Text, nullable=False, default="")
+    prompt = Column(Text, nullable=False)
+    sample_text = Column(Text, nullable=False, default="")
+    source = Column(String, nullable=False, default="")
+    source_voice_id = Column(String, nullable=True)
+    source_url = Column(Text, nullable=True)
+    gender = Column(String, nullable=True)
+    age_range = Column(String, nullable=True)
+    language = Column(String, nullable=False, default="zh")
     created_at = Column(DateTime, default=datetime.utcnow)

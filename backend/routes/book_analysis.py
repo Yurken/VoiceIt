@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Book analysis endpoint (B4).
 
 Provides POST /books/{book_id}/analyze — enqueues the GPU-coordinated
@@ -34,18 +35,19 @@ async def analyze_book(
     """
     book = db.query(database.Book).filter_by(id=book_id).first()
     if book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=404, detail="未找到这本书")
 
     if book.status in ("analyzing", "generating"):
         raise HTTPException(
             status_code=409,
-            detail=f"Book is already {book.status}",
+            detail="这本书正在分析，请等待完成" if book.status == "analyzing" else "这本书正在生成音频，请等待完成",
         )
 
     task_id = book_analysis.enqueue_analysis(
         book_id,
         body.model_size,
         body.narrator_voice_id,
+        voice_mode=body.voice_mode if "voice_mode" in body.model_fields_set else None,
     )
 
     return models.AnalyzeResponse(

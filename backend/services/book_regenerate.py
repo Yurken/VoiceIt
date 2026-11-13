@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -32,9 +31,9 @@ logger = logging.getLogger(__name__)
 def regenerate_segment(
     segment_id: str,
     *,
-    emotion: Optional[str] = None,
-    instruct: Optional[str] = None,
-    seed: Optional[int] = None,
+    emotion: str | None = None,
+    instruct: str | None = None,
+    seed: int | None = None,
     db: Session,
 ):
     """Re-render a single BookSegment as a new GenerationVersion.
@@ -64,11 +63,13 @@ def regenerate_segment(
         HTTPException 409: if the segment's book is currently generating.
     """
     from fastapi import HTTPException
+
     from .. import database
     from ..models import RegenerateResponse
     from . import task_queue
+    from .book_characters import profile_engine
+    from .book_generation import _DEFAULT_ENGINE, _DEFAULT_MODEL_SIZE, compose_instruct, stable_voice_seed
     from .generation import run_generation
-    from .book_generation import compose_instruct, _DEFAULT_ENGINE, _DEFAULT_MODEL_SIZE
 
     # ── Look up segment ────────────────────────────────────────────────────
     segment = db.query(database.BookSegment).filter_by(id=segment_id).first()
@@ -105,6 +106,18 @@ def regenerate_segment(
     if gen is None:
         raise HTTPException(status_code=404, detail="Generation not found for segment")
 
+    # Edits may have reassigned this line to another character since its first
+    # render. Follow the current roster binding, not the historical take.
+    character = db.get(database.BookCharacter, segment.character_id) if segment.character_id else None
+    profile_id = character.profile_id if character else gen.profile_id
+    profile = db.get(database.VoiceProfile, profile_id) if profile_id else None
+    if profile is None:
+        raise HTTPException(status_code=409, detail="角色尚未绑定可用声音，请先选择声音档案")
+    engine = profile_engine(profile) if profile else gen.engine or _DEFAULT_ENGINE
+    model_size = gen.model_size if gen.engine == engine else None
+    model_size = model_size or ("default" if engine == "breeze" else _DEFAULT_MODEL_SIZE)
+    language = "zh" if any("\u4e00" <= c <= "\u9fff" for c in segment.text) else gen.language or "zh"
+
     # ── Compose instruct ───────────────────────────────────────────────────
     # Caller may supply a full override; otherwise recompose from the segment.
     if instruct is not None:
@@ -134,24 +147,25 @@ def regenerate_segment(
 
     # Flip segment status to pending
     segment.audio_status = "pending"
+    gen.profile_id = profile_id
+    gen.text = segment.text
+    gen.language = language
+    gen.engine = engine
+    gen.model_size = model_size
     db.commit()
     db.refresh(version)
 
     version_id = version.id
 
     # ── Build and enqueue the run_generation coroutine ────────────────────
-    engine = gen.engine or _DEFAULT_ENGINE
-    model_size = gen.model_size or _DEFAULT_MODEL_SIZE
-    profile_id = gen.profile_id
-
     inner = run_generation(
         generation_id=generation_id,
         profile_id=profile_id,
-        text=gen.text,
-        language=gen.language or "en",
+        text=segment.text,
+        language=language,
         engine=engine,
         model_size=model_size,
-        seed=seed,
+        seed=seed if seed is not None else stable_voice_seed(profile_id),
         instruct=effective_instruct,
         mode="regenerate",
         version_id=version_id,
@@ -164,10 +178,13 @@ def regenerate_segment(
         version_id=version_id,
         inner_coro=inner,
     )
+    wrapped = task_queue.with_coro_cleanup(wrapped, inner)
 
     try:
         task_queue.enqueue_generation(generation_id, wrapped)
     except Exception:
+        wrapped.close()
+        inner.close()
         logger.exception(
             "Failed to enqueue regeneration for segment %s / generation %s",
             segment_id,
@@ -176,7 +193,7 @@ def regenerate_segment(
         # Mark the segment as errored so the UI does not hang.
         segment.audio_status = "error"
         db.commit()
-        raise HTTPException(status_code=503, detail="Queue unavailable")
+        raise HTTPException(status_code=503, detail="Queue unavailable") from None
 
     return RegenerateResponse(
         segment_id=segment_id,
@@ -194,8 +211,8 @@ def regenerate_segment(
 async def preview_segment(
     segment_id: str,
     *,
-    emotion: Optional[str] = None,
-    instruct: Optional[str] = None,
+    emotion: str | None = None,
+    instruct: str | None = None,
     db: Session,
 ) -> dict:
     """Synthesize a preview clip for a segment WITHOUT mutating any stored data.
@@ -222,6 +239,7 @@ async def preview_segment(
         HTTPException 409 if the book is currently generating.
     """
     from fastapi import HTTPException
+
     from .. import database
     from .book_characters import preview_character_voice
 
@@ -304,6 +322,7 @@ class _SegmentProxy:
         self.emotion = emotion_override
         self.emotion_intensity = getattr(segment, "emotion_intensity", None)
         self.delivery = getattr(segment, "delivery", None)
+        self.voice_stage = getattr(segment, "voice_stage", None)
 
 
 async def _regenerate_with_completion_hook(
@@ -336,6 +355,8 @@ async def _regenerate_with_completion_hook(
         try:
             segment = db.query(database.BookSegment).filter_by(id=segment_id).first()
             if segment is not None:
+                generation = db.get(database.Generation, segment.generation_id) if segment.generation_id else None
+                success = success and generation is not None and generation.status == "completed"
                 segment.audio_status = "completed" if success else "error"
                 db.commit()
 

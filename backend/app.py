@@ -243,11 +243,17 @@ async def _run_startup(application: FastAPI) -> None:
             sa_text(
                 "UPDATE generations SET status = 'failed', "
                 "error = 'Server was shut down during generation' "
-                "WHERE status IN ('generating', 'loading_model')"
+                "WHERE status IN ('pending', 'generating', 'loading_model')"
             )
         )
         if result.rowcount > 0:
             logger.info("Marked %d stale generation(s) as failed", result.rowcount)
+
+        db.execute(sa_text("UPDATE book_segments SET audio_status = 'error' WHERE audio_status IN ('pending', 'generating')"))
+        db.execute(sa_text("UPDATE books SET status = 'analyzed' WHERE status = 'generating'"))
+        db.execute(sa_text("UPDATE books SET status = 'analyzed' WHERE status = 'exporting'"))
+        from .services.book_analysis import recover_interrupted_analyses
+        recover_interrupted_analyses(db)
 
         from .database import VoiceProfile as DBVoiceProfile, Generation as DBGeneration
 
@@ -297,6 +303,12 @@ async def _run_startup(application: FastAPI) -> None:
 async def _run_shutdown() -> None:
     """Unload models on lifespan exit."""
     logger.info("VoiceIt server shutting down...")
+    from . import backends
+    for backend in list(backends._tts_backends.values()):
+        try:
+            backend.unload_model()
+        except Exception:
+            logger.exception("Failed to unload TTS backend")
     try:
         tts.unload_tts_model()
     except Exception:

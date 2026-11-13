@@ -974,7 +974,7 @@ class ApiClient {
 
   async importBook(
     file: File,
-    opts?: { model_size?: string; narrator_voice_id?: string },
+    opts?: { model_size?: string; narrator_voice_id?: string; voice_mode?: 'preset' | 'designed' },
   ): Promise<BookDetailResponse> {
     const form = new FormData();
     form.append('file', file);
@@ -996,7 +996,7 @@ class ApiClient {
 
   async analyzeBook(
     bookId: string,
-    opts?: { model_size?: string; narrator_voice_id?: string },
+    opts?: { model_size?: string; narrator_voice_id?: string; voice_mode?: 'preset' | 'designed' },
   ): Promise<BookAnalyzeResponse> {
     return this.request<BookAnalyzeResponse>(`/books/${bookId}/analyze`, {
       method: 'POST',
@@ -1058,6 +1058,13 @@ class ApiClient {
 
   async getVoiceOptions(bookId: string): Promise<VoiceOptions> {
     return this.request<VoiceOptions>(`/books/${bookId}/voice-options`);
+  }
+
+  async listVoicePrompts(opts?: { q?: string; category?: string }): Promise<import('./types').VoiceDesignPrompt[]> {
+    const query = new URLSearchParams();
+    if (opts?.q) query.set('q', opts.q);
+    if (opts?.category) query.set('category', opts.category);
+    return this.request<import('./types').VoiceDesignPrompt[]>(`/voice-prompts?${query}`);
   }
 
   async saveVoiceToLibrary(charId: string): Promise<VoiceProfileSummary> {

@@ -74,6 +74,7 @@ export interface GenerationRequest {
   engine?:
     | 'qwen'
     | 'qwen_custom_voice'
+    | 'breeze'
     | 'luxtts'
     | 'chatterbox'
     | 'chatterbox_turbo'
@@ -504,6 +505,8 @@ export type BookStatus =
   | 'analyzing'
   | 'analyzed'
   | 'generating'
+  | 'exporting'
+  | 'ready'
   | 'completed'
   | 'error';
 
@@ -545,6 +548,8 @@ export interface BookResponse {
   chapter_count: number;
   created_at: string;
   updated_at: string;
+  export_filename?: string | null;
+  export_format?: ExportFormat | null;
 }
 
 export interface BookDetailResponse extends BookResponse {
@@ -587,6 +592,7 @@ export interface CharacterUpdateRequest {
   color?: string;
   profile_id?: string;
   design_prompt?: string;
+  prompt_id?: string;
   preset_voice_id?: string;
   is_narrator?: boolean;
 }
@@ -617,6 +623,9 @@ export interface SegmentResponse {
   emotion: string;
   emotion_intensity: number;
   delivery?: string;
+  voice_stage?: string | null;
+  analysis_metadata?: Record<string, unknown>;
+  flagged?: boolean;
   order: number;
   audio: SegmentAudio;
 }
@@ -626,6 +635,8 @@ export interface SegmentUpdateRequest {
   emotion?: string;
   emotion_intensity?: number;
   delivery?: string;
+  voice_stage?: string | null;
+  flagged?: boolean;
   text?: string;
   type?: SegmentType;
 }
@@ -650,6 +661,7 @@ export interface CharacterPreviewRequest {
   profile_id?: string;
   preset_voice_id?: string;
   design_prompt?: string;
+  prompt_id?: string;
 }
 
 export interface CharacterPreviewResponse {
@@ -686,6 +698,23 @@ export interface GenerateBookRequest {
   engine?: string;
   model_size?: string;
   overwrite_errors?: boolean;
+  chapter_ids?: string[];
+  concurrency?: number;
+}
+
+export interface VoiceDesignPrompt {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  prompt: string;
+  sample_text: string;
+  source: string;
+  source_voice_id?: string;
+  source_url?: string;
+  gender?: string;
+  age_range?: string;
+  language: string;
 }
 
 export interface GenerateBookResponse {

@@ -38,6 +38,27 @@ async def run_pinned(executor: ThreadPoolExecutor, fn: Callable, *args):
     return await loop.run_in_executor(executor, fn, *args)
 
 
+def find_cached_model_snapshot(hf_repo: str, required_files: list[str]) -> Path | None:
+    """Find a complete revision without treating unrelated partial blobs as missing weights."""
+    from huggingface_hub import constants as hf_constants
+
+    repo_cache = Path(hf_constants.HF_HUB_CACHE) / ("models--" + hf_repo.replace("/", "--"))
+    snapshots = repo_cache / "snapshots"
+    if not snapshots.is_dir():
+        return None
+
+    candidates = sorted(snapshots.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True)
+    main_ref = repo_cache / "refs/main"
+    if main_ref.is_file():
+        preferred = snapshots / main_ref.read_text().strip()
+        if preferred.is_dir():
+            candidates.insert(0, preferred)
+    for candidate in candidates:
+        if candidate.is_dir() and all((candidate / filename).is_file() for filename in required_files):
+            return candidate
+    return None
+
+
 def is_model_cached(
     hf_repo: str,
     *,
@@ -59,6 +80,9 @@ def is_model_cached(
     try:
         from huggingface_hub import constants as hf_constants
 
+        if required_files:
+            return find_cached_model_snapshot(hf_repo, required_files) is not None
+
         repo_cache = Path(hf_constants.HF_HUB_CACHE) / ("models--" + hf_repo.replace("/", "--"))
 
         if not repo_cache.exists():
@@ -73,13 +97,6 @@ def is_model_cached(
         snapshots_dir = repo_cache / "snapshots"
         if not snapshots_dir.exists():
             return False
-
-        if required_files:
-            # Check that every required filename exists somewhere in snapshots
-            for fname in required_files:
-                if not any(snapshots_dir.rglob(fname)):
-                    return False
-            return True
 
         # Check that at least one weight file exists
         for ext in weight_extensions:

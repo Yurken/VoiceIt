@@ -52,7 +52,13 @@ async function fetchHuggingFaceModelInfo(repoId: string): Promise<HuggingFaceMod
   return response.json();
 }
 
+function isRemoteModelRepo(repoId?: string | null): boolean {
+  return !!repoId && /^[\w.-]+\/[\w.-]+$/.test(repoId);
+}
+
 const MODEL_DESCRIPTIONS: Record<string, string> = {
+  'breeze-tts':
+    '使用已有本地 Breeze TTS 2 模型与独立 MLX 环境，可按文字设计声音、复用角色参考音频并控制情绪。',
   'qwen-tts-1.7B':
     'High-quality multilingual TTS by Alibaba. Supports 10 languages with natural prosody and voice cloning from short reference audio.',
   'qwen-tts-0.6B':
@@ -180,7 +186,7 @@ export function ModelManagement() {
   const { data: hfModelInfo, isLoading: hfLoading } = useQuery({
     queryKey: ['hfModelInfo', selectedModel?.hf_repo_id],
     queryFn: () => fetchHuggingFaceModelInfo(selectedModel!.hf_repo_id!),
-    enabled: detailOpen && !!selectedModel?.hf_repo_id,
+    enabled: detailOpen && isRemoteModelRepo(selectedModel?.hf_repo_id),
     staleTime: 1000 * 60 * 30, // Cache for 30 minutes
     retry: 1,
   });
@@ -414,6 +420,7 @@ export function ModelManagement() {
         m.model_name.startsWith('luxtts') ||
         m.model_name.startsWith('chatterbox') ||
         m.model_name.startsWith('tada') ||
+        m.model_name.startsWith('breeze') ||
         m.model_name.startsWith('kokoro'),
     ) ?? [];
   const whisperModels = modelStatus?.models.filter((m) => m.model_name.startsWith('whisper')) ?? [];
@@ -680,7 +687,7 @@ export function ModelManagement() {
               <DialogHeader>
                 <DialogTitle>{freshSelectedModel.display_name}</DialogTitle>
                 <DialogDescription className="flex items-center gap-1.5">
-                  {freshSelectedModel.hf_repo_id ? (
+                  {isRemoteModelRepo(freshSelectedModel.hf_repo_id) ? (
                     <a
                       href={`https://huggingface.co/${freshSelectedModel.hf_repo_id}`}
                       target="_blank"
@@ -691,7 +698,9 @@ export function ModelManagement() {
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   ) : (
-                    freshSelectedModel.model_name
+                    <span className="break-all">
+                      {freshSelectedModel.hf_repo_id || freshSelectedModel.model_name}
+                    </span>
                   )}
                 </DialogDescription>
               </DialogHeader>
@@ -885,28 +894,30 @@ export function ModelManagement() {
                             : t('models.actions.unload')}
                         </Button>
                       )}
-                      <Button
-                        size="sm"
-                        onClick={() => {
-                          setModelToDelete({
-                            name: freshSelectedModel.model_name,
-                            displayName: freshSelectedModel.display_name,
-                            sizeMb: freshSelectedModel.size_mb,
-                          });
-                          setDeleteDialogOpen(true);
-                        }}
-                        variant="outline"
-                        disabled={freshSelectedModel.loaded}
-                        title={
-                          freshSelectedModel.loaded
-                            ? t('models.actions.unloadFirst')
-                            : t('models.actions.deleteModel')
-                        }
-                        className="flex-1"
-                      >
-                        <Trash2 className="h-4 w-4 mr-2" />
-                        {t('models.actions.deleteModel')}
-                      </Button>
+                      {isRemoteModelRepo(freshSelectedModel.hf_repo_id) && (
+                        <Button
+                          size="sm"
+                          onClick={() => {
+                            setModelToDelete({
+                              name: freshSelectedModel.model_name,
+                              displayName: freshSelectedModel.display_name,
+                              sizeMb: freshSelectedModel.size_mb,
+                            });
+                            setDeleteDialogOpen(true);
+                          }}
+                          variant="outline"
+                          disabled={freshSelectedModel.loaded}
+                          title={
+                            freshSelectedModel.loaded
+                              ? t('models.actions.unloadFirst')
+                              : t('models.actions.deleteModel')
+                          }
+                          className="flex-1"
+                        >
+                          <Trash2 className="h-4 w-4 mr-2" />
+                          {t('models.actions.deleteModel')}
+                        </Button>
+                      )}
                     </div>
                   ) : (
                     <Button

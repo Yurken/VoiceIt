@@ -82,8 +82,10 @@ def hf_cache(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def client(fresh_progress, fresh_tasks, hf_cache):
+def client(fresh_progress, fresh_tasks, hf_cache, monkeypatch):
     """FastAPI TestClient with just the models router mounted."""
+    # Filesystem/lifecycle tests must not initialise a real Metal device.
+    monkeypatch.setattr(models_route, "get_backend_type", lambda: "pytorch")
     app = FastAPI()
     app.include_router(models_router)
     with TestClient(app) as c:
@@ -930,6 +932,7 @@ def test_download_completes_task_when_load_func_resolves(
     asyncio.run(_drive())
 
     assert not fresh_tasks.is_download_active("luxtts")
+    assert fresh_progress.get_progress("luxtts")["status"] == "complete"
 
 
 # ---------------------------------------------------------------------------
@@ -1055,3 +1058,35 @@ def test_delete_returns_500_when_rmtree_raises_oserror(client, monkeypatch, hf_c
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_status_recognizes_complete_external_local_model(client, monkeypatch, tmp_path):
+    import backend.backends as registry
+
+    local = tmp_path / "Breeze-TTS-2-mlx-8bit"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"weights")
+    cfg = _make_config(model_name="breeze-tts", hf_repo_id=str(local), engine="breeze")
+    cfg.required_files = ["config.json", "model.safetensors"]
+    monkeypatch.setattr(registry, "get_all_model_configs", lambda: [cfg])
+    monkeypatch.setattr(registry, "check_model_loaded", lambda config: False)
+    response = client.get("/models/status")
+    assert response.status_code == 200
+    assert response.json()["models"][0]["downloaded"] is True
+    (local / "config.json").unlink()
+    assert client.get("/models/status").json()["models"][0]["downloaded"] is False
+
+
+def test_deleting_external_local_model_preserves_shared_files(client, monkeypatch, tmp_path):
+    import backend.backends as registry
+
+    local = tmp_path / "shared-model"
+    local.mkdir()
+    weights = local / "model.safetensors"
+    weights.write_bytes(b"shared-weights")
+    cfg = _make_config(model_name="breeze-tts", hf_repo_id=str(local), engine="breeze")
+    monkeypatch.setattr(registry, "get_model_config", lambda name: cfg)
+    response = client.delete("/models/breeze-tts")
+    assert response.status_code == 400
+    assert weights.read_bytes() == b"shared-weights"

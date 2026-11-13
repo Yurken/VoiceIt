@@ -249,6 +249,7 @@ async def get_model_status():
             "display_name": cfg.display_name,
             "hf_repo_id": cfg.hf_repo_id,
             "model_size": cfg.model_size,
+            "required_files": getattr(cfg, "required_files", None),
             "check_loaded": lambda c=cfg: check_model_loaded(c),
         }
         for cfg in registry_configs
@@ -339,6 +340,20 @@ async def get_model_status():
                 except Exception:
                     pass
 
+            if config["required_files"]:
+                from ..backends.base import find_cached_model_snapshot
+
+                local_path = Path(config["hf_repo_id"])
+                if local_path.is_absolute():
+                    snapshot = local_path if all((local_path / name).is_file() for name in config["required_files"]) else None
+                else:
+                    snapshot = find_cached_model_snapshot(config["hf_repo_id"], config["required_files"])
+                downloaded = snapshot is not None
+                size_mb = (
+                    sum(path.stat().st_size for path in snapshot.rglob("*") if path.is_file()) / (1024 * 1024)
+                    if snapshot is not None else None
+                )
+
             try:
                 loaded = config["check_loaded"]()
             except Exception:
@@ -403,6 +418,7 @@ async def trigger_model_download(request: models.ModelDownloadRequest):
             result = load_func()
             if asyncio.iscoroutine(result):
                 await result
+            progress_manager.mark_complete(request.model_name)
             task_manager.complete_download(request.model_name)
         except Exception as e:
             task_manager.error_download(request.model_name, str(e))
@@ -452,6 +468,8 @@ async def delete_model(model_name: str):
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
 
     hf_repo_id = config.hf_repo_id
+    if Path(hf_repo_id).is_absolute():
+        raise HTTPException(status_code=400, detail="这是外部共享的本地模型，VoiceIt 仅连接使用；请在模型所在目录管理文件")
 
     try:
         unload_model_by_config(config)

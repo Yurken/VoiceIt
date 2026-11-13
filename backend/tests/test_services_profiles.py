@@ -381,7 +381,7 @@ class TestValidateProfileEngine:
     def test_designed_profile_passes(self, db_session):
         profile = _make_designed_profile(db_session)
         # No raise.
-        profiles_service.validate_profile_engine(profile, "qwen")
+        profiles_service.validate_profile_engine(profile, "breeze")
 
     def test_designed_profile_missing_prompt_raises(self, db_session):
         profile = _make_designed_profile(db_session)
@@ -876,13 +876,24 @@ class TestCreateVoicePromptForProfile:
 
     @pytest.mark.asyncio
     async def test_returns_design_prompt_for_designed_profile(
-        self, db_session, data_dir
+        self, db_session, data_dir, monkeypatch
     ):
+        from unittest.mock import AsyncMock
+        import backend.backends as backends
+        fake = _FakeTTSBackend()
+        fake.generate = AsyncMock(return_value=(np.zeros(24000, dtype=np.float32), 24000))
+        monkeypatch.setattr(backends, "get_tts_backend_for_engine", lambda engine: fake)
         profile = _make_designed_profile(db_session, design_prompt="Husky alto")
         result = await profiles_service.create_voice_prompt_for_profile(
-            profile.id, db_session, engine="qwen"
+            profile.id, db_session, engine="breeze"
         )
-        assert result == {"voice_type": "designed", "design_prompt": "Husky alto"}
+        again = await profiles_service.create_voice_prompt_for_profile(profile.id, db_session, engine="breeze")
+        assert result == again
+        assert result["voice_type"] == "designed"
+        assert result["design_prompt"] == "Husky alto"
+        fake.generate.assert_awaited_once()
+        sample = db_session.query(DBProfileSample).filter_by(profile_id=profile.id).one()
+        assert config.resolve_storage_path(sample.audio_path).is_file()
 
     @pytest.mark.asyncio
     async def test_cloned_profile_with_non_cloning_engine_raises(

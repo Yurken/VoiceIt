@@ -1,11 +1,12 @@
 """Voice profile management module."""
 
+import asyncio
+import hashlib
 import json as _json
 import logging
 import shutil
 import uuid
 from datetime import datetime
-from pathlib import Path
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -24,7 +25,8 @@ from ..utils.images import process_avatar, validate_image
 
 logger = logging.getLogger(__name__)
 
-CLONING_ENGINES = {"qwen", "luxtts", "chatterbox", "chatterbox_turbo", "tada"}
+CLONING_ENGINES = {"qwen", "luxtts", "chatterbox", "chatterbox_turbo", "tada", "breeze"}
+_design_locks: dict[str, asyncio.Lock] = {}
 
 
 def _profile_to_response(
@@ -129,6 +131,8 @@ def validate_profile_engine(profile, engine: str) -> None:
         design_prompt = getattr(profile, "design_prompt", None)
         if not design_prompt or not design_prompt.strip():
             raise ValueError(f"Designed profile {profile.id} is missing design_prompt")
+        if engine != "breeze":
+            raise ValueError("自定义设计声音请使用 Breeze 引擎")
         return
 
     if engine not in CLONING_ENGINES:
@@ -558,14 +562,32 @@ async def create_voice_prompt_for_profile(
             "preset_voice_id": profile.preset_voice_id,
         }
 
-    # ── Designed profiles: return text description (future) ──
+    # Persist one reference per design. Every chapter clones the same anchor.
     if voice_type == "designed":
         if not profile.design_prompt or not profile.design_prompt.strip():
             raise ValueError(f"Designed profile {profile_id} is missing design_prompt")
-        return {
-            "voice_type": "designed",
-            "design_prompt": profile.design_prompt,
-        }
+        async with _design_locks.setdefault(profile_id, asyncio.Lock()):
+            tts_model = get_tts_backend_for_engine(engine)
+            digest = hashlib.sha256(profile.design_prompt.encode("utf-8")).hexdigest()[:16]
+            path = config.get_profiles_dir() / profile_id / f"designed-{digest}.wav"
+            storage_path = config.to_storage_path(path)
+            reference_text = "夜色渐深，远处的灯光依然亮着。我停下脚步，认真听完了这个故事。" if profile.language in {"zh", "chinese"} else "The evening was quiet. I stopped beside the window and listened carefully to the rest of the story."
+            sample = db.query(DBProfileSample).filter_by(profile_id=profile_id, audio_path=storage_path).first()
+            if not path.is_file():
+                audio, sample_rate = await tts_model.generate(
+                    reference_text, {"voice_type": "designed", "design_prompt": profile.design_prompt},
+                    language=profile.language or "zh", seed=int(digest[:8], 16) & 0x7fffffff,
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(".tmp.wav")
+                save_audio(audio, str(temporary), sample_rate)
+                temporary.replace(path)
+            if sample is None:
+                sample = DBProfileSample(id=str(uuid.uuid4()), profile_id=profile_id, audio_path=storage_path, reference_text=reference_text)
+                db.add(sample)
+                db.commit()
+            voice_prompt, _ = await tts_model.create_voice_prompt(str(path), sample.reference_text, use_cache=use_cache)
+            return {**voice_prompt, "voice_type": "designed", "design_prompt": profile.design_prompt}
 
     if engine not in CLONING_ENGINES:
         raise ValueError(f"Engine '{engine}' does not support cloned voice profiles")
@@ -605,8 +627,6 @@ async def create_voice_prompt_for_profile(
 
     # Save combined audio to cache directory (persistent)
     # Create a hash of sample IDs to identify this specific combination
-    import hashlib
-
     sample_ids_str = "-".join(sorted([s.id for s in samples]))
     combination_hash = hashlib.md5(sample_ids_str.encode()).hexdigest()[:12]
 

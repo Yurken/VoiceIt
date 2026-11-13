@@ -91,6 +91,8 @@ def generate_book(
         engine=body.engine,
         model_size=body.model_size,
         overwrite_errors=body.overwrite_errors,
+        chapter_ids=body.chapter_ids,
+        concurrency=body.concurrency,
     )
 
     return models.GenerateResponse(

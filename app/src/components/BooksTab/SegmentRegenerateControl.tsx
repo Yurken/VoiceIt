@@ -15,6 +15,7 @@
  *   />
  */
 
+import { useTranslation } from 'react-i18next';
 import { useRegenerateSegment } from '@/lib/hooks/useBooks';
 
 interface SegmentRegenerateControlProps {
@@ -40,6 +41,7 @@ export function SegmentRegenerateControl({
   audioStatus,
   onDone,
 }: SegmentRegenerateControlProps) {
+  const { t } = useTranslation();
   const { mutate: regenerate, isPending } = useRegenerateSegment();
 
   const isPendingOrGenerating =
@@ -64,19 +66,19 @@ export function SegmentRegenerateControl({
       className="flex w-full items-center gap-1.5 rounded px-2 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
       onClick={handleRegenerate}
       disabled={isPendingOrGenerating}
-      title={isPendingOrGenerating ? 'Re-rendering this line…' : 'Regenerate this line'}
+      title={t(isPendingOrGenerating ? 'books.chapterEditor.regenerating' : 'books.chapterEditor.regenerateLine')}
     >
       {isPendingOrGenerating ? (
         <>
           <span
             data-testid={`regenerate-spinner-${segmentId}`}
             className="inline-block size-3 animate-spin rounded-full border-2 border-current border-t-transparent"
-            aria-label="Re-rendering"
+            aria-label={t('books.chapterEditor.regenerating')}
           />
-          Re-rendering…
+          {t('books.chapterEditor.regenerating')}
         </>
       ) : (
-        <>↻ Regenerate</>
+        <>↻ {t('books.chapterEditor.regenerate')}</>
       )}
     </button>
   );

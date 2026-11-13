@@ -43,6 +43,23 @@ def _make_chapter(tmp_path: Path, chapter_num: int, n_segments: int = 3) -> dict
     }
 
 
+def _probe_audio(path: str) -> dict:
+    """Inspect the produced artifact through FFmpeg's public metadata view."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-print_format", "json", path],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def _audio_packet_hash(path: str) -> str:
+    return subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-c:a", "copy",
+         "-f", "hash", "-hash", "sha256", "-"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
 # ---------------------------------------------------------------------------
 # Import the service under test (will fail RED before implementation exists)
 # ---------------------------------------------------------------------------
@@ -195,6 +212,7 @@ class TestExportM4B:
             },
         )
         assert Path(out_path).exists()
+        assert any(stream.get("disposition", {}).get("attached_pic") == 1 for stream in _probe_audio(out_path)["streams"])
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +247,10 @@ class TestExportMP3Single:
                 "author": "Test Author",
             },
         )
-        from mutagen.id3 import ID3
-        tags = ID3(out_path)
-        assert "TIT2" in tags, "Title tag should be present"
-        assert str(tags["TIT2"]) == "My Audiobook"
+        tags = _probe_audio(out_path)["format"]["tags"]
+        assert tags["title"] == "My Audiobook"
+        assert tags["album"] == "My Audiobook"
+        assert tags["artist"] == "Test Author"
 
     def test_mp3_with_cover(self, two_chapter_book, cover_image, tmp_path):
         chapters, _ = two_chapter_book
@@ -246,10 +264,9 @@ class TestExportMP3Single:
                 "cover_path": cover_image,
             },
         )
-        from mutagen.id3 import ID3
-        tags = ID3(out_path)
-        # mutagen stores APIC as "APIC:Cover" or "APIC:<desc>" — check any APIC key
-        assert any(k.startswith("APIC") for k in tags), "Cover art tag should be present"
+        streams = _probe_audio(out_path)["streams"]
+        assert any(stream.get("disposition", {}).get("attached_pic") == 1 for stream in streams)
+
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +325,11 @@ class TestExportMP3PerChapter:
             with tempfile.TemporaryDirectory() as td:
                 zf.extract(mp3_names[0], td)
                 mp3_path = os.path.join(td, mp3_names[0])
-                from mutagen.id3 import ID3
-                tags = ID3(mp3_path)
-                assert "TALB" in tags, "Album tag (book title) should be present"
-                assert "TRCK" in tags, "Track number tag should be present"
+                tags = _probe_audio(mp3_path)["format"]["tags"]
+                assert tags["title"] == "Chapter 1"
+                assert tags["album"] == "My Book"
+                assert tags["artist"] == "Someone"
+                assert tags["track"] == "1"
 
     def test_zip_with_cover(self, two_chapter_book, cover_image, tmp_path):
         chapters, _ = two_chapter_book
@@ -326,6 +344,12 @@ class TestExportMP3PerChapter:
             },
         )
         assert Path(out_path).exists()
+        with zipfile.ZipFile(out_path) as archive, tempfile.TemporaryDirectory() as directory:
+            for name in archive.namelist():
+                extracted = archive.extract(name, directory)
+                streams = _probe_audio(extracted)["streams"]
+                assert any(stream.get("disposition", {}).get("attached_pic") == 1 for stream in streams)
+
 
 
 # ---------------------------------------------------------------------------
@@ -614,3 +638,115 @@ class TestM4BSkippedChapter:
         assert starts[1] > starts[0], (
             f"Second marker ({starts[1]}) should start after first ({starts[0]})"
         )
+
+
+class TestStreamingExport:
+    def test_staged_segments_are_released_instead_of_retaining_the_book(self, tmp_path, monkeypatch):
+        import weakref
+        import backend.services.audiobook_export as service
+
+        chapters = [_make_chapter(tmp_path, number, n_segments=4) for number in range(1, 5)]
+        original_load = service.load_audio
+        loaded_arrays = []
+
+        def tracked_load(*args, **kwargs):
+            # A streaming writer may still hold the preceding segment at the
+            # next read, but must not retain all previous segments or chapters.
+            assert sum(reference() is not None for reference in loaded_arrays) <= 1
+            audio, rate = original_load(*args, **kwargs)
+            loaded_arrays.append(weakref.ref(audio))
+            return audio, rate
+
+        monkeypatch.setattr(service, "load_audio", tracked_load)
+        out_dir = tmp_path / "out"
+        output, _ = service.export_book(chapters, str(out_dir), {"format": "mp3_single", "title": "Bounded"})
+        assert len(loaded_arrays) == 16
+        assert all(reference() is None for reference in loaded_arrays)
+        assert list(out_dir.iterdir()) == [Path(output)]
+
+    def test_streamed_scene_pauses_chapter_pauses_and_markers_keep_exact_timing(self, tmp_path):
+        segment = str(tmp_path / "short.wav")
+        _make_sine_wav(segment, duration=0.2)
+        chapters = [
+            {"number": 1, "title": "Scene", "segment_paths": [segment, {"path": segment, "is_scene_break": True}, segment]},
+            {"number": 2, "title": "After", "segment_paths": [segment, segment]},
+        ]
+        output, _ = export_book(chapters, str(tmp_path / "out"), {
+            "format": "m4b", "title": "Timing", "inter_segment_pause_s": 0.15,
+            "scene_pause_s": 0.7, "chapter_pause_s": 0.6,
+        })
+        markers = read_chapter_markers(output)
+        assert markers[1]["start"] == pytest.approx(2.05, abs=0.01)
+        assert float(_probe_audio(output)["format"]["duration"]) == pytest.approx(2.6, abs=0.08)
+
+    def test_concat_manifest_handles_quotes_in_the_output_directory(self, tmp_path):
+        chapter = _make_chapter(tmp_path, 1, n_segments=1)
+        output, _ = export_book([chapter], str(tmp_path / "speaker's export"), {"format": "mp3_single", "title": "Quoted"})
+        assert _probe_audio(output)["format"]["tags"]["title"] == "Quoted"
+
+
+class TestFFmpegMP3Tags:
+    def test_tagging_copies_audio_packets_and_preserves_unicode_metadata(self, tmp_path, cover_image):
+        from backend.services.audiobook_export import _embed_mp3_tags, _encode_mp3
+
+        wave = str(tmp_path / "voice.wav")
+        output = str(tmp_path / "voice.mp3")
+        _make_sine_wav(wave)
+        _encode_mp3(wave, output)
+        packet_hash = _audio_packet_hash(output)
+        _embed_mp3_tags(output, title="夏夜的约定", album="多角色小说", artist="作者", track_num=7, cover_path=cover_image)
+        assert _audio_packet_hash(output) == packet_hash
+        probe = _probe_audio(output)
+        assert probe["format"]["tags"]["title"] == "夏夜的约定"
+        assert probe["format"]["tags"]["album"] == "多角色小说"
+        assert probe["format"]["tags"]["artist"] == "作者"
+        assert probe["format"]["tags"]["track"] == "7"
+        assert any(stream.get("disposition", {}).get("attached_pic") == 1 for stream in probe["streams"])
+
+    def test_remux_failure_leaves_original_intact_and_cleans_temporary_file(self, tmp_path, monkeypatch):
+        import backend.services.audiobook_export as service
+
+        original = tmp_path / "original.mp3"
+        original.write_bytes(b"unchanged audio")
+
+        def fail_remux(command):
+            Path(command[-1]).write_bytes(b"incomplete temporary output")
+            raise RuntimeError("tagging failed")
+
+        monkeypatch.setattr(service, "_run_ffmpeg", fail_remux)
+        with pytest.raises(RuntimeError, match="tagging failed"):
+            service._embed_mp3_tags(str(original), title="Changed")
+        assert original.read_bytes() == b"unchanged audio"
+        assert list(tmp_path.iterdir()) == [original]
+
+
+    def test_m4b_preserves_special_characters_in_book_and_chapter_metadata(self, tmp_path):
+        chapter = _make_chapter(tmp_path, 1, n_segments=1)
+        chapter["title"] = "雨夜; #1=灯光"
+        output, _ = export_book([chapter], str(tmp_path / "out"), {"format": "m4b", "title": "夏夜; #序章=月光", "author": "作者; #某人"})
+        tags = _probe_audio(output)["format"]["tags"]
+        assert tags["title"] == "夏夜; #序章=月光"
+        assert tags["artist"] == "作者; #某人"
+        assert read_chapter_markers(output)[0]["title"] == chapter["title"]
+
+
+    @pytest.mark.parametrize("output_format,extension", [("m4b", ".m4b"), ("mp3_single", ".mp3"), ("mp3_per_chapter", ".zip")])
+    def test_failed_reexport_preserves_existing_complete_artifact(self, tmp_path, monkeypatch, output_format, extension):
+        import backend.services.audiobook_export as service
+
+        chapter = _make_chapter(tmp_path, 1, n_segments=1)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        existing = out_dir / f"Preserve{extension}"
+        existing.write_bytes(b"previous complete audiobook")
+
+        def fail_encode(*args, **kwargs):
+            Path(args[1]).write_bytes(b"incomplete new encode")
+            raise RuntimeError("encode interrupted")
+
+        monkeypatch.setattr(service, "_encode_mp3", fail_encode)
+        monkeypatch.setattr(service, "_encode_aac_m4b", fail_encode)
+        with pytest.raises(RuntimeError, match="encode interrupted"):
+            service.export_book([chapter], str(out_dir), {"format": output_format, "title": "Preserve"})
+        assert existing.read_bytes() == b"previous complete audiobook"
+        assert list(out_dir.iterdir()) == [existing]

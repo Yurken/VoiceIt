@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from ..database import Book, BookCharacter, BookSegment, Chapter, Generation
 from ..models import SegmentAudio, SegmentResponse, SegmentUpdate
+from ..utils.voice_stages import normalize_voice_stage
 
 
 def segment_to_response(seg: BookSegment, db: Session) -> SegmentResponse:
@@ -61,6 +62,9 @@ def segment_to_response(seg: BookSegment, db: Session) -> SegmentResponse:
         emotion=seg.emotion,
         emotion_intensity=seg.emotion_intensity,
         delivery=seg.delivery,
+        voice_stage=normalize_voice_stage(getattr(seg, "voice_stage", None)),
+        analysis_metadata=getattr(seg, "analysis_metadata", None) or {},
+        flagged=bool(getattr(seg, "flagged", False)),
         order=seg.order,
         audio=audio,
     )
@@ -126,6 +130,11 @@ def update_segment(
         seg.delivery = payload.delivery
         changed = True
 
+    # An explicit null clears the age hint; omitted fields leave it untouched.
+    if "voice_stage" in payload.model_fields_set and payload.voice_stage != normalize_voice_stage(seg.voice_stage):
+        seg.voice_stage = payload.voice_stage
+        changed = True
+
     if payload.text is not None and payload.text != seg.text:
         seg.text = payload.text
         changed = True
@@ -138,7 +147,11 @@ def update_segment(
     if changed and seg.generation_id is not None:
         seg.audio_status = "stale"
 
-    if changed:
+    review_changed = payload.flagged is not None and payload.flagged != seg.flagged
+    if review_changed:
+        seg.flagged = payload.flagged
+
+    if changed or review_changed:
         db.commit()
         db.refresh(seg)
 

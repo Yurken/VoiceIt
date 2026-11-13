@@ -14,7 +14,8 @@
  *   export-format, export-metadata (+ cover-drop), export-action (+ export-status,
  *   start-export-btn, download-btn)
  */
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -36,11 +37,7 @@ import { useBooksStore } from '@/stores/booksStore';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const FORMAT_LABELS: Record<ExportFormat, string> = {
-  m4b: 'M4B Audiobook',
-  mp3_single: 'MP3 (single file)',
-  mp3_per_chapter: 'MP3 per chapter (ZIP)',
-};
+const EXPORT_FORMATS: ExportFormat[] = ['m4b', 'mp3_single', 'mp3_per_chapter'];
 
 const FORMAT_EXT: Record<ExportFormat, string> = {
   m4b: '.m4b',
@@ -50,9 +47,17 @@ const FORMAT_EXT: Record<ExportFormat, string> = {
 
 type ExportPhase = 'idle' | 'running' | 'complete' | 'error';
 
+function exportFormat(filename?: string): ExportFormat | undefined {
+  if (filename?.toLowerCase().endsWith('.zip')) return 'mp3_per_chapter';
+  if (filename?.toLowerCase().endsWith('.mp3')) return 'mp3_single';
+  if (filename?.toLowerCase().endsWith('.m4b')) return 'm4b';
+  return undefined;
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function AudiobookExport() {
+  const { t } = useTranslation();
   const selectedBookId = useBooksStore((s) => s.selectedBookId);
   const setView = useBooksStore((s) => s.setView);
 
@@ -63,14 +68,44 @@ export function AudiobookExport() {
   const [bitrate, setBitrate] = useState<ExportBitrate>('128k');
   const [title, setTitle] = useState(book?.title ?? '');
   const [author, setAuthor] = useState(book?.author ?? '');
-  const [coverFile, setCoverFile] = useState<File | null>(null);
-  const coverInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    setTitle(book?.title ?? '');
+    setAuthor(book?.author ?? '');
+  }, [book?.id, book?.title, book?.author]);
 
   // ── Export state ─────────────────────────────────────────────────────────────
   const [phase, setPhase] = useState<ExportPhase>('idle');
   const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
+  const [completedExport, setCompletedExport] = useState<{ format: ExportFormat; filename?: string } | null>(null);
+  const restoredBookId = useRef<string | null>(null);
+  const previouslyExporting = useRef(false);
+
+  useEffect(() => {
+    if (!book) return;
+    const initialLoad = restoredBookId.current !== book.id;
+    restoredBookId.current = book.id;
+    const finishedExport = previouslyExporting.current && book.status !== 'exporting';
+    previouslyExporting.current = book.status === 'exporting';
+    if (book.status === 'exporting') {
+      setPhase('running');
+      setStatusMessage(t('books.export.exporting'));
+    } else if (book.export_filename) {
+      const savedFormat = book.export_format ?? exportFormat(book.export_filename) ?? 'm4b';
+      setCompletedExport({ format: savedFormat, filename: book.export_filename });
+      if (initialLoad || finishedExport) setFormat(savedFormat);
+      setProgress(100);
+      setPhase('complete');
+      setStatusMessage(t('books.export.complete'));
+    } else if (initialLoad) {
+      setCompletedExport(null);
+      setPhase('idle');
+      setProgress(0);
+      setErrorMessage('');
+    }
+    // Restore on server state changes, preserving edits to the next export form.
+  }, [book?.id, book?.status, book?.export_filename, book?.export_format, t]);
 
   // ── Hooks ─────────────────────────────────────────────────────────────────────
   const startExport = useStartExport();
@@ -79,6 +114,7 @@ export function AudiobookExport() {
   // ── SSE handlers ─────────────────────────────────────────────────────────────
 
   const onExportProgress = useCallback((event: ExportProgressEvent) => {
+    setPhase('running');
     setProgress(event.progress);
     if ('message' in event && typeof (event as any).message === 'string') {
       setStatusMessage((event as any).message as string);
@@ -86,15 +122,17 @@ export function AudiobookExport() {
   }, []);
 
   const onExportComplete = useCallback(
-    (_event: ExportCompleteEvent) => {
+    (event: ExportCompleteEvent) => {
+      setCompletedExport({ format: exportFormat(event.filename) ?? format, filename: event.filename });
       setProgress(100);
       setPhase('complete');
-      setStatusMessage('Export complete');
+      setStatusMessage(t('books.export.complete'));
     },
-    [],
+    [t, format],
   );
 
   const onError = useCallback((event: BookErrorEvent) => {
+    if (event.stage === 'connection') return;
     setPhase('error');
     setErrorMessage(event.message);
   }, []);
@@ -110,8 +148,9 @@ export function AudiobookExport() {
   async function handleStartExport() {
     if (!selectedBookId) return;
     setPhase('running');
+    setCompletedExport(null);
     setProgress(0);
-    setStatusMessage('Starting export...');
+    setStatusMessage(t('books.export.starting'));
     setErrorMessage('');
 
     try {
@@ -126,7 +165,7 @@ export function AudiobookExport() {
       });
     } catch (err: unknown) {
       setPhase('error');
-      setErrorMessage(err instanceof Error ? err.message : 'Export failed');
+      setErrorMessage(err instanceof Error ? err.message : t('books.export.failed'));
     }
   }
 
@@ -136,25 +175,11 @@ export function AudiobookExport() {
       await downloadExport.mutateAsync({
         bookId: selectedBookId,
         bookTitle: title || book?.title || 'audiobook',
-        format,
+        format: completedExport?.format ?? format,
+        filename: completedExport?.filename,
       });
     } catch (err: unknown) {
-      setErrorMessage(err instanceof Error ? err.message : 'Download failed');
-    }
-  }
-
-  function handleCoverDrop(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault();
-    const file = e.dataTransfer.files?.[0];
-    if (file && file.type.startsWith('image/')) {
-      setCoverFile(file);
-    }
-  }
-
-  function handleCoverInput(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (file) {
-      setCoverFile(file);
+      setErrorMessage(err instanceof Error ? err.message : t('books.export.downloadFailed'));
     }
   }
 
@@ -168,30 +193,30 @@ export function AudiobookExport() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold">Export Audiobook</h1>
+          <h1 className="text-2xl font-bold">{t('books.export.title')}</h1>
           {book?.title && (
             <p className="text-sm text-muted-foreground mt-0.5">{book.title}</p>
           )}
         </div>
         <Button variant="ghost" onClick={() => setView('overview')}>
-          Back to overview
+          {t('books.export.back')}
         </Button>
       </div>
 
-      <div className="flex gap-4 items-start">
+      <div className="flex flex-col md:flex-row gap-4 items-start">
         {/* Left column: format + quality */}
         <div className="flex flex-col gap-4 flex-1">
           {/* Format selection */}
           <Card>
             <CardContent className="p-4">
-              <h2 className="text-lg font-semibold mb-3">Format</h2>
+              <h2 className="text-lg font-semibold mb-3">{t('books.export.format')}</h2>
               <div
                 data-testid="export-format"
                 className="flex flex-col gap-2"
                 role="radiogroup"
-                aria-label="Export format"
+                aria-label={t('books.export.format')}
               >
-                {(Object.keys(FORMAT_LABELS) as ExportFormat[]).map((fmt) => (
+                {EXPORT_FORMATS.map((fmt) => (
                   <label
                     key={fmt}
                     className={cn(
@@ -206,6 +231,7 @@ export function AudiobookExport() {
                       name="export-format"
                       value={fmt}
                       checked={format === fmt}
+                      disabled={isRunning}
                       onChange={() => setFormat(fmt)}
                       className="sr-only"
                     />
@@ -220,7 +246,7 @@ export function AudiobookExport() {
                       )}
                     </span>
                     <div>
-                      <div className="font-medium text-sm">{FORMAT_LABELS[fmt]}</div>
+                      <div className="font-medium text-sm">{t(`books.export.${fmt}`)}</div>
                       <div className="text-xs text-muted-foreground">{FORMAT_EXT[fmt]}</div>
                     </div>
                   </label>
@@ -232,13 +258,14 @@ export function AudiobookExport() {
           {/* Quality */}
           <Card>
             <CardContent className="p-4">
-              <h2 className="text-lg font-semibold mb-3">Quality</h2>
+              <h2 className="text-lg font-semibold mb-3">{t('books.export.quality')}</h2>
               <div className="flex flex-col gap-2">
                 <Label htmlFor="bitrate-select" className="text-sm">
-                  Bitrate
+                  {t('books.export.bitrate')}
                 </Label>
                 <Select
                   value={bitrate}
+                  disabled={isRunning}
                   onValueChange={(val) => setBitrate(val as ExportBitrate)}
                 >
                   <SelectTrigger id="bitrate-select">
@@ -259,74 +286,36 @@ export function AudiobookExport() {
           {/* Metadata */}
           <Card>
             <CardContent className="p-4">
-              <h2 className="text-lg font-semibold mb-3">Metadata</h2>
+              <h2 className="text-lg font-semibold mb-3">{t('books.export.metadata')}</h2>
               <div
                 data-testid="export-metadata"
                 className="flex flex-col gap-3"
               >
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="export-title" className="text-sm">
-                    Title
+                    {t('books.export.bookTitle')}
                   </Label>
                   <Input
                     id="export-title"
+                    disabled={isRunning}
                     value={title}
                     onChange={(e) => setTitle(e.target.value)}
-                    placeholder={book?.title ?? 'Book title'}
+                    placeholder={book?.title ?? t('books.export.bookTitlePlaceholder')}
                   />
                 </div>
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="export-author" className="text-sm">
-                    Author
+                    {t('books.export.author')}
                   </Label>
                   <Input
                     id="export-author"
+                    disabled={isRunning}
                     value={author}
                     onChange={(e) => setAuthor(e.target.value)}
-                    placeholder={book?.author ?? 'Author name'}
+                    placeholder={book?.author ?? t('books.export.authorPlaceholder')}
                   />
                 </div>
 
-                {/* Cover drop zone */}
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-sm">Cover image</Label>
-                  <div
-                    data-testid="cover-drop"
-                    className={cn(
-                      'relative flex flex-col items-center justify-center rounded-md border-2 border-dashed p-6 text-center cursor-pointer transition-colors',
-                      coverFile
-                        ? 'border-primary bg-primary/5'
-                        : 'border-border hover:border-primary/50 hover:bg-accent/20',
-                    )}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={handleCoverDrop}
-                    onClick={() => coverInputRef.current?.click()}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => e.key === 'Enter' && coverInputRef.current?.click()}
-                    aria-label="Drop cover image here or click to select"
-                  >
-                    {coverFile ? (
-                      <p className="text-sm font-medium">{coverFile.name}</p>
-                    ) : (
-                      <>
-                        <p className="text-sm text-muted-foreground">
-                          Drop cover image here
-                        </p>
-                        <p className="text-xs text-muted-foreground mt-0.5">
-                          or click to browse
-                        </p>
-                      </>
-                    )}
-                    <input
-                      ref={coverInputRef}
-                      type="file"
-                      accept="image/*"
-                      className="sr-only"
-                      onChange={handleCoverInput}
-                    />
-                  </div>
-                </div>
               </div>
             </CardContent>
           </Card>
@@ -342,7 +331,7 @@ export function AudiobookExport() {
                 <div data-testid="export-status" className="min-h-[56px]">
                   {phase === 'idle' && (
                     <p className="text-sm text-muted-foreground">
-                      Ready to export. Choose your format and click Start.
+                      {t('books.export.ready')}
                     </p>
                   )}
 
@@ -350,7 +339,7 @@ export function AudiobookExport() {
                     <div className="flex flex-col gap-2">
                       <div className="flex items-center justify-between">
                         <p className="text-sm text-muted-foreground">
-                          {statusMessage || 'Exporting…'}
+                          {statusMessage || t('books.export.exporting')}
                         </p>
                         <Badge variant="secondary">{Math.round(progress)}%</Badge>
                       </div>
@@ -361,7 +350,7 @@ export function AudiobookExport() {
                   {phase === 'complete' && (
                     <div className="flex items-center gap-2">
                       <Badge variant="default" className="border-green-700 text-green-400">
-                        Done
+                        {t('books.export.done')}
                       </Badge>
                       <p className="text-sm text-muted-foreground">{statusMessage}</p>
                     </div>
@@ -372,6 +361,7 @@ export function AudiobookExport() {
                   )}
                 </div>
 
+                {phase !== 'error' && errorMessage && <p className="text-sm text-destructive" role="alert">{errorMessage}</p>}
                 {/* Buttons */}
                 <div className="flex gap-2">
                   <Button
@@ -380,7 +370,7 @@ export function AudiobookExport() {
                     disabled={isRunning}
                     className="flex-1"
                   >
-                    {isRunning ? 'Exporting…' : 'Start Export'}
+                    {t(isRunning ? 'books.export.exporting' : 'books.export.start')}
                   </Button>
 
                   <Button
@@ -391,8 +381,8 @@ export function AudiobookExport() {
                     className="flex-1"
                   >
                     {downloadExport.isPending
-                      ? 'Downloading…'
-                      : `Download ${FORMAT_EXT[format]}`}
+                      ? t('books.export.downloading')
+                      : t('books.export.download', { ext: FORMAT_EXT[completedExport?.format ?? format] })}
                   </Button>
                 </div>
               </div>

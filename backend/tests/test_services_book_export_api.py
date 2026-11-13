@@ -14,6 +14,8 @@ Targets uncovered branches in:
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -31,6 +33,42 @@ from backend.database import (
     Generation,
 )
 from backend.services import book_export_api
+
+
+@pytest.mark.asyncio
+async def test_export_keeps_event_loop_responsive_and_download_survives_restart(db_session, tmp_path, monkeypatch):
+    book = _make_book(db_session)
+    output_dir = tmp_path / "exports" / book.id
+    output_dir.mkdir(parents=True)
+    output = output_dir / "有声书.mp3"
+    output.write_bytes(b"encoded audio")
+    release = threading.Event()
+    entered = threading.Event()
+
+    def encode(**options):
+        entered.set()
+        assert release.wait(2), "The application event loop did not remain responsive"
+        return str(output), output.name
+
+    monkeypatch.setattr(book_export_api, "get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(book_export_api, "_collect_chapters", lambda *args: [])
+    monkeypatch.setattr(book_export_api.audiobook_export, "export_book", encode)
+    task = asyncio.create_task(book_export_api.run_export_task(book.id, {"format": "mp3_single"}, db_session))
+    try:
+        for _ in range(50):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        assert not task.done()
+    finally:
+        release.set()
+        await task
+    assert db_session.get(Book, book.id).status == "ready"
+    book_export_api._export_cache.pop(book.id, None)
+    recovered = book_export_api.get_export_entry(book.id)
+    assert recovered == {"path": str(output), "filename": output.name}
+    assert json.loads((output_dir / "export.json").read_text())["filename"] == output.name
 
 
 # ---------------------------------------------------------------------------

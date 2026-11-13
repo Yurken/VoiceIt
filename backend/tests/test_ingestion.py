@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001, RUF003
 """Tests for the ebook ingestion service (all four formats)."""
 
 import pytest
@@ -192,6 +193,7 @@ def test_txt_no_chapter_headings_single_chapter(tmp_path):
 # Fix 1: XXE hardening in FB2 parser
 # ---------------------------------------------------------------------------
 
+
 def test_fb2_xxe_entity_not_expanded(tmp_path):
     """FB2 with an internal entity declaration must not expand it (XXE hardening).
 
@@ -202,15 +204,15 @@ def test_fb2_xxe_entity_not_expanded(tmp_path):
     # An internal entity that would expand to a sensitive string
     xxe_fb2 = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<!DOCTYPE FictionBook [\n'
+        "<!DOCTYPE FictionBook [\n"
         '  <!ENTITY xxe "SECRET_EXPANDED_CONTENT">\n'
-        ']>\n'
+        "]>\n"
         '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">\n'
-        ' <description><title-info>\n'
-        '   <book-title>XXE Test</book-title>\n'
-        ' </title-info></description>\n'
-        ' <body><section><p>&xxe;</p></section></body>\n'
-        '</FictionBook>'
+        " <description><title-info>\n"
+        "   <book-title>XXE Test</book-title>\n"
+        " </title-info></description>\n"
+        " <body><section><p>&xxe;</p></section></body>\n"
+        "</FictionBook>"
     )
     p = tmp_path / "xxe.fb2"
     p.write_text(xxe_fb2, encoding="utf-8")
@@ -230,14 +232,13 @@ def test_fb2_xxe_entity_not_expanded(tmp_path):
     else:
         # No exception — verify entity was NOT silently expanded
         full_text = " ".join(c.text for c in result.chapters)
-        assert "SECRET_EXPANDED_CONTENT" not in full_text, (
-            "Entity was expanded — XXE hardening not applied"
-        )
+        assert "SECRET_EXPANDED_CONTENT" not in full_text, "Entity was expanded — XXE hardening not applied"
 
 
 # ---------------------------------------------------------------------------
 # Fix 2: EPUB nav/TOC must not appear as a chapter
 # ---------------------------------------------------------------------------
+
 
 def test_epub_nav_not_included_as_chapter(tmp_path):
     """The EPUB NAV document must be filtered out and not produce a chapter."""
@@ -262,22 +263,20 @@ def test_epub_nav_not_included_as_chapter(tmp_path):
 
     # Should have exactly 1 real content chapter (not 2 due to nav)
     assert len(result.chapters) == 1, (
-        f"Expected 1 chapter but got {len(result.chapters)}: "
-        f"{[c.title for c in result.chapters]}"
+        f"Expected 1 chapter but got {len(result.chapters)}: {[c.title for c in result.chapters]}"
     )
     # The chapter should contain the real content, not nav boilerplate
     assert "dark night" in result.chapters[0].text
     # No chapter should be solely the book title (which nav often renders)
     for chapter in result.chapters:
         stripped = chapter.text.strip()
-        assert stripped != "Silo", (
-            f"Chapter text is just the title — likely the nav doc leaked in: {stripped!r}"
-        )
+        assert stripped != "Silo", f"Chapter text is just the title — likely the nav doc leaked in: {stripped!r}"
 
 
 # ---------------------------------------------------------------------------
 # Fix 3: Multi-page PDF header/footer stripping
 # ---------------------------------------------------------------------------
+
 
 def test_pdf_header_footer_stripped(tmp_path):
     """Running header on every page must be stripped; body text must survive.
@@ -292,9 +291,9 @@ def test_pdf_header_footer_stripped(tmp_path):
     # body-text y-coords are page-unique (appear on only 1/3 pages) and thus
     # survive the Counter-based filter, while the header y appears on all pages.
     BODY_TEXTS = [
-        ("First page body text.", 100),   # page 1 body at y=100
+        ("First page body text.", 100),  # page 1 body at y=100
         ("Second page body text.", 200),  # page 2 body at y=200
-        ("Third page body text.", 300),   # page 3 body at y=300
+        ("Third page body text.", 300),  # page 3 body at y=300
     ]
 
     doc = fitz.open()
@@ -312,12 +311,51 @@ def test_pdf_header_footer_stripped(tmp_path):
     full_text = " ".join(c.text for c in result.chapters)
 
     # Header must have been stripped (it appeared on all 3 pages at same y)
-    assert HEADER not in full_text, (
-        f"Repeated header {HEADER!r} was NOT stripped from output"
-    )
+    assert HEADER not in full_text, f"Repeated header {HEADER!r} was NOT stripped from output"
     # Body content must still be present (each at a unique y-position, count=1/3)
     for body_text, _ in BODY_TEXTS:
         keyword = body_text.split()[0]  # "First", "Second", "Third"
-        assert keyword in full_text, (
-            f"Body keyword {keyword!r} missing — body text was incorrectly stripped"
-        )
+        assert keyword in full_text, f"Body keyword {keyword!r} missing — body text was incorrectly stripped"
+
+
+def test_chinese_headings_front_matter_and_gb18030_are_preserved(tmp_path):
+    from backend.services.ingestion import count_text_units
+
+    text = "这是前言。\n第一章 风起\n林默说：“你好。”\n第２章 重逢\n三十年后，他们重逢。"
+    path = tmp_path / "长夜.txt"
+    path.write_bytes(text.encode("gb18030"))
+    parsed = parse_book(str(path), "txt")
+    assert len(parsed.chapters) == 3
+    assert "第一章 风起" in parsed.chapters[1].text
+    assert "第２章 重逢" in parsed.chapters[2].text
+    assert "".join(c.text for c in parsed.chapters).replace("\n", "") == text.replace("\n", "")
+    assert count_text_units("长夜漫漫 hello world") == 6
+
+
+def test_giant_chinese_line_is_automatically_fragmented_without_truncation(tmp_path):
+    from backend.services.ingestion import MAX_CHAPTER_CHARS
+
+    text = "林默在山谷中穿行。" * 7000
+    path = tmp_path / "大部头.txt"
+    path.write_text(text, encoding="utf-8")
+    result = parse_book(str(path), "txt")
+    assert len(result.chapters) > 2
+    assert max(len(c.text) for c in result.chapters) <= MAX_CHAPTER_CHARS
+    assert "".join(c.text for c in result.chapters) == text
+    assert len({c.title for c in result.chapters}) == len(result.chapters)
+
+
+@pytest.mark.parametrize(
+    "text,language",
+    [
+        ("林默说，明天我们还会再见。", "zh"),
+        ("明日はまた会いましょう。", "ja"),
+        ("We will meet again tomorrow.", "en"),
+        ("Мы встретимся завтра.", "ru"),
+        ("내일 다시 만나요.", "ko"),
+    ],
+)
+def test_text_language_uses_novel_language(text, language):
+    from backend.services.ingestion import detect_text_language
+
+    assert detect_text_language(text) == language

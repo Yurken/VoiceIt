@@ -1,10 +1,12 @@
-import { render, screen } from '@testing-library/react';
+import '@/i18n';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { act } from 'react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { AnalysisProgress } from '@/components/BooksTab/AnalysisProgress';
 import { useBooksStore } from '@/stores/booksStore';
 
 let handlers: any;
+const { analyzeMutate } = vi.hoisted(() => ({ analyzeMutate: vi.fn() }));
 
 vi.mock('@/lib/hooks/useBookProgress', () => ({
   useBookProgress: (_id: string, h: any) => {
@@ -13,6 +15,7 @@ vi.mock('@/lib/hooks/useBookProgress', () => ({
 }));
 
 vi.mock('@/lib/hooks/useBooks', () => ({
+  useAnalyzeBook: () => ({ mutate: analyzeMutate, isPending: false }),
   useBook: () => ({ data: { status: 'analyzing' } }),
 }));
 
@@ -22,6 +25,7 @@ vi.mock('@tanstack/react-query', () => ({
 
 describe('AnalysisProgress', () => {
   beforeEach(() => {
+    analyzeMutate.mockClear();
     handlers = undefined;
     useBooksStore.getState().reset();
     useBooksStore.getState().setSelectedBookId('b1');
@@ -168,7 +172,7 @@ describe('AnalysisProgress', () => {
     expect(screen.getByText(/something went wrong/i)).toBeInTheDocument();
   });
 
-  it('shows retry button after error', () => {
+  it('retries with saved server options instead of forcing another model', () => {
     render(<AnalysisProgress />);
     act(() => {
       handlers.onError?.({
@@ -178,6 +182,11 @@ describe('AnalysisProgress', () => {
       });
     });
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    expect(analyzeMutate).toHaveBeenCalledWith(
+      { bookId: 'b1', opts: {} },
+      expect.objectContaining({ onError: expect.any(Function) }),
+    );
   });
 
   it('shows line count in character row', () => {

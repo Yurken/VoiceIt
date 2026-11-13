@@ -21,6 +21,7 @@ const ENGINE_OPTIONS = [
   { value: 'qwen:0.6B', label: 'Qwen3-TTS 0.6B', engine: 'qwen' },
   { value: 'qwen_custom_voice:1.7B', label: 'Qwen CustomVoice 1.7B', engine: 'qwen_custom_voice' },
   { value: 'qwen_custom_voice:0.6B', label: 'Qwen CustomVoice 0.6B', engine: 'qwen_custom_voice' },
+  { value: 'breeze', label: 'Breeze TTS 2（自定义音色）', engine: 'breeze' },
   { value: 'luxtts', label: 'LuxTTS', engine: 'luxtts' },
   { value: 'chatterbox', label: 'Chatterbox', engine: 'chatterbox' },
   { value: 'chatterbox_turbo', label: 'Chatterbox Turbo', engine: 'chatterbox_turbo' },
@@ -32,6 +33,7 @@ const ENGINE_OPTIONS = [
 const ENGINE_DESCRIPTIONS: Record<string, string> = {
   qwen: 'Multi-language, two sizes',
   qwen_custom_voice: '9 preset voices, instruct control',
+  breeze: '本地声音设计、参考声音克隆与情绪控制',
   luxtts: 'Fast, English-focused',
   chatterbox: '23 languages, incl. Hebrew',
   chatterbox_turbo: 'English, [laugh] [cough] tags',
@@ -43,7 +45,14 @@ const ENGINE_DESCRIPTIONS: Record<string, string> = {
 const ENGLISH_ONLY_ENGINES = new Set(['luxtts', 'chatterbox_turbo']);
 
 /** Engines that support cloned (reference audio) profiles. */
-const CLONING_ENGINES = new Set(['qwen', 'luxtts', 'chatterbox', 'chatterbox_turbo', 'tada']);
+const CLONING_ENGINES = new Set([
+  'qwen',
+  'breeze',
+  'luxtts',
+  'chatterbox',
+  'chatterbox_turbo',
+  'tada',
+]);
 
 function getAvailableOptions(selectedProfile?: VoiceProfileResponse | null) {
   if (!selectedProfile) return ENGINE_OPTIONS;
@@ -166,5 +175,5 @@ export function isProfileCompatibleWithEngine(
   const voiceType = profile.voice_type || 'cloned';
   if (voiceType === 'preset') return profile.preset_engine === engine;
   if (voiceType === 'cloned') return CLONING_ENGINES.has(engine);
-  return true; // designed — future
+  return engine === (profile.default_engine || 'breeze');
 }

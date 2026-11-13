@@ -10,7 +10,7 @@
  * - Error events surface the message inside export-status.
  */
 /// <reference types="@testing-library/jest-dom/vitest" />
-import '@/i18n';
+import i18n from '@/i18n';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AudiobookExport } from '@/components/BooksTab/AudiobookExport';
@@ -29,11 +29,12 @@ vi.mock('@/lib/hooks/useBookProgress', () => ({
   },
 }));
 
+let mockBookData: Record<string, unknown>;
 const mockStartExport = vi.fn();
 const mockDownloadExport = vi.fn();
 vi.mock('@/lib/hooks/useBooks', () => ({
   useBook: () => ({
-    data: { id: 'book-1', title: 'Test Book', author: 'Jane Doe', status: 'ready' },
+    data: mockBookData,
   }),
   useStartExport: () => ({
     mutateAsync: mockStartExport,
@@ -57,6 +58,7 @@ vi.mock('@/stores/booksStore', () => ({
 
 describe('AudiobookExport', () => {
   beforeEach(() => {
+    mockBookData = { id: 'book-1', title: 'Test Book', author: 'Jane Doe', status: 'ready' };
     exportProgressHandler = undefined;
     exportCompleteHandler = undefined;
     errorHandler = undefined;
@@ -66,16 +68,67 @@ describe('AudiobookExport', () => {
     mockDownloadExport.mockResolvedValue(new Blob());
   });
 
+
+  it('restores a completed export and its filename after a page reload', async () => {
+    mockBookData = { ...mockBookData, export_filename: '整本有声书.zip', export_format: 'mp3_per_chapter' };
+    render(<AudiobookExport />);
+    expect(screen.getByTestId('download-btn')).toBeEnabled();
+    expect(screen.getByTestId('download-btn')).toHaveTextContent('.zip');
+    expect(screen.getByLabelText(/MP3 per chapter/)).toBeChecked();
+    await act(async () => { fireEvent.click(screen.getByTestId('download-btn')); });
+    expect(mockDownloadExport.mock.calls[0][0]).toEqual({ bookId: 'book-1', bookTitle: 'Test Book', format: 'mp3_per_chapter', filename: '整本有声书.zip' });
+  });
+
+  it('restores an in-progress export without allowing a duplicate export', () => {
+    mockBookData = { ...mockBookData, status: 'exporting' };
+    render(<AudiobookExport />);
+    expect(screen.getByTestId('start-export-btn')).toBeDisabled();
+    expect(screen.getByTestId('download-btn')).toBeDisabled();
+    expect(screen.getByLabelText('Title')).toBeDisabled();
+    expect(screen.getByTestId('export-status')).toHaveTextContent(/Exporting/);
+  });
+
+  it('restores download availability when polling observes completion without an SSE event', () => {
+    mockBookData = { ...mockBookData, status: 'exporting' };
+    const { rerender } = render(<AudiobookExport />);
+    expect(screen.getByTestId('download-btn')).toBeDisabled();
+    mockBookData = { ...mockBookData, status: 'ready', export_filename: 'Recovered.mp3', export_format: 'mp3_single' };
+    rerender(<AudiobookExport />);
+    expect(screen.getByTestId('download-btn')).toBeEnabled();
+    expect(screen.getByTestId('download-btn')).toHaveTextContent('.mp3');
+  });
+
+  it('keeps the completed artifact format when the next export form changes', async () => {
+    mockBookData = { ...mockBookData, export_filename: 'Completed.m4b', export_format: 'm4b' };
+    render(<AudiobookExport />);
+    fireEvent.click(screen.getByLabelText(/MP3 \(single file\)/));
+    expect(screen.getByTestId('download-btn')).toHaveTextContent('.m4b');
+    await act(async () => { fireEvent.click(screen.getByTestId('download-btn')); });
+    expect(mockDownloadExport.mock.calls[0][0]).toEqual({ bookId: 'book-1', bookTitle: 'Test Book', format: 'm4b', filename: 'Completed.m4b' });
+  });
+
+  it('localizes the back button when the application is Chinese', async () => {
+    await i18n.changeLanguage('zh-CN');
+    try {
+      render(<AudiobookExport />);
+      expect(screen.getByRole('button', { name: '返回书籍总览' })).toBeInTheDocument();
+      expect(screen.queryByText('Back to overview')).not.toBeInTheDocument();
+    } finally {
+      await i18n.changeLanguage('en');
+    }
+  });
+
   it('renders the export-format radio group', () => {
     render(<AudiobookExport />);
     expect(screen.getByTestId('export-format')).toBeInTheDocument();
   });
 
-  it('renders export-metadata section with title, author, and cover-drop', () => {
+  it('renders export metadata with the detected title and author', () => {
     render(<AudiobookExport />);
     const metadata = screen.getByTestId('export-metadata');
     expect(metadata).toBeInTheDocument();
-    expect(metadata.querySelector('[data-testid="cover-drop"]')).toBeInTheDocument();
+    expect(screen.getByLabelText('Title')).toHaveValue('Test Book');
+    expect(screen.getByLabelText('Author')).toHaveValue('Jane Doe');
   });
 
   it('renders export-action section', () => {
@@ -227,42 +280,8 @@ describe('AudiobookExport', () => {
     expect(authorInput.value).toBe('New Author');
   });
 
-  it('dropping an image file onto cover-drop shows its filename', () => {
-    render(<AudiobookExport />);
-    const dropZone = screen.getByTestId('cover-drop');
-    const file = new File(['cover-bytes'], 'mycover.png', { type: 'image/png' });
 
-    fireEvent.drop(dropZone, {
-      dataTransfer: { files: [file] },
-    });
 
-    expect(dropZone).toHaveTextContent('mycover.png');
-  });
-
-  it('dropping a non-image file onto cover-drop is ignored', () => {
-    render(<AudiobookExport />);
-    const dropZone = screen.getByTestId('cover-drop');
-    const file = new File(['plain'], 'notes.txt', { type: 'text/plain' });
-
-    fireEvent.drop(dropZone, {
-      dataTransfer: { files: [file] },
-    });
-
-    // Drop zone still shows the placeholder copy, not the rejected filename.
-    expect(dropZone).not.toHaveTextContent('notes.txt');
-    expect(dropZone).toHaveTextContent(/drop cover image here/i);
-  });
-
-  it('choosing a file via the hidden cover input shows its filename', () => {
-    render(<AudiobookExport />);
-    const dropZone = screen.getByTestId('cover-drop');
-    const fileInput = dropZone.querySelector('input[type="file"]') as HTMLInputElement;
-    const file = new File(['cover'], 'picked.jpg', { type: 'image/jpeg' });
-
-    fireEvent.change(fileInput, { target: { files: [file] } });
-
-    expect(dropZone).toHaveTextContent('picked.jpg');
-  });
 
   it('surfaces a failure from startExport as the error status message', async () => {
     mockStartExport.mockRejectedValueOnce(new Error('network down'));
@@ -330,62 +349,8 @@ describe('AudiobookExport', () => {
     expect(screen.getByTestId('export-status')).toHaveTextContent(/ready to export/i);
   });
 
-  it('pressing Enter on the cover drop zone opens the file picker', () => {
-    render(<AudiobookExport />);
-    const dropZone = screen.getByTestId('cover-drop');
-    const fileInput = dropZone.querySelector('input[type="file"]') as HTMLInputElement;
-    // Receiver-capture pattern: record each invocation of the DOM-host input.click
-    // method so we can assert on the captured shape (a single, no-arg invocation
-    // that targeted the cover-drop's own hidden <input type="file">) rather than
-    // a generic call-count probe.
-    const captured: Array<{ receiver: HTMLInputElement; args: unknown[] }> = [];
-    const clickSpy = vi.spyOn(fileInput, 'click').mockImplementation(function (
-      this: HTMLInputElement,
-      ...args: unknown[]
-    ) {
-      captured.push({ receiver: this, args });
-    });
 
-    fireEvent.keyDown(dropZone, { key: 'Enter' });
 
-    expect(captured).toEqual([{ receiver: fileInput, args: [] }]);
-    // Paired DOM observable: the drop zone remains mounted in its idle copy
-    // (the keyboard interaction only opens the picker, it does not pick a file).
-    expect(dropZone).toHaveTextContent(/drop cover image here/i);
-    clickSpy.mockRestore();
-  });
-
-  it('clicking the cover drop zone opens the file picker', () => {
-    render(<AudiobookExport />);
-    const dropZone = screen.getByTestId('cover-drop');
-    const fileInput = dropZone.querySelector('input[type="file"]') as HTMLInputElement;
-    // Receiver-capture pattern: the drop zone's onClick delegates to the hidden
-    // file input's native click(); capture each invocation so we can assert on
-    // the recorded shape (one no-arg call, addressed to the same hidden input).
-    const captured: Array<{ receiver: HTMLInputElement; args: unknown[] }> = [];
-    const clickSpy = vi.spyOn(fileInput, 'click').mockImplementation(function (
-      this: HTMLInputElement,
-      ...args: unknown[]
-    ) {
-      captured.push({ receiver: this, args });
-    });
-
-    fireEvent.click(dropZone);
-
-    expect(captured).toEqual([{ receiver: fileInput, args: [] }]);
-    // Paired DOM observable: clicking the host opens the picker but does not
-    // populate a file, so the placeholder copy is still showing.
-    expect(dropZone).toHaveTextContent(/drop cover image here/i);
-    clickSpy.mockRestore();
-  });
-
-  it('dragging over the cover drop zone does not change its visible copy', () => {
-    render(<AudiobookExport />);
-    const dropZone = screen.getByTestId('cover-drop');
-    // Exercises the onDragOver preventDefault handler without changing state.
-    fireEvent.dragOver(dropZone);
-    expect(dropZone).toHaveTextContent(/drop cover image here/i);
-  });
 
   it('clicking download after export_complete triggers a download with the selected format and title', async () => {
     render(<AudiobookExport />);
@@ -421,6 +386,7 @@ describe('AudiobookExport', () => {
         bookId: 'book-1',
         bookTitle: 'My Custom Title',
         format: 'm4b',
+        filename: 'test.m4b',
       },
     ]);
     // Paired DOM observable: the download button remains rendered with the

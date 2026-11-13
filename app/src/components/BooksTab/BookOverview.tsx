@@ -10,7 +10,7 @@
  *
  * data-testids match wireframe-03 and are consumed by S3 (c8.spec.ts) and S8 (d2.spec.ts).
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -32,6 +32,9 @@ import {
   useCharacters,
   useDeleteCharacter,
   useGenerateChapter,
+  useGenerateBook,
+  useBookGenerationStatus,
+  useAnalyzeBook,
   useMergeCharacter,
 } from '@/lib/hooks/useBooks';
 import { useBookProgress } from '@/lib/hooks/useBookProgress';
@@ -46,11 +49,6 @@ import { useBooksStore } from '@/stores/booksStore';
 import { toast } from '@/components/ui/use-toast';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Format large numbers with locale-appropriate separators (3,410 / 4.002) */
-function fmtNumber(n: number): string {
-  return n.toLocaleString();
-}
 
 /** Estimate runtime in hours+minutes assuming ~150 wpm narration */
 function estimateRuntime(totalWords: number): { h: number; m: number } {
@@ -125,12 +123,12 @@ function CharCard({ char, selected, onToggle, onDrillIn }: CharCardProps) {
           {char.name}
         </button>
         <div className="flex flex-wrap gap-1 mt-0.5">
-          {char.is_narrator && <Badge variant="secondary">narration</Badge>}
+          {char.is_narrator && <Badge variant="secondary">{t('books.overview.narration')}</Badge>}
           {char.role && !char.is_narrator && (
-            <Badge variant="secondary">{char.role}</Badge>
+            <Badge variant="secondary">{t(`books.roles.${char.role}`, { defaultValue: char.role })}</Badge>
           )}
           {!char.is_narrator && char.dialogue_count > 0 && (
-            <Badge variant="outline">{char.dialogue_count} lines</Badge>
+            <Badge variant="outline">{t('books.overview.lines', { count: char.dialogue_count })}</Badge>
           )}
           {!char.is_narrator && (
             <Badge
@@ -160,7 +158,7 @@ function CharCard({ char, selected, onToggle, onDrillIn }: CharCardProps) {
         <span aria-hidden>🎙</span>
         <span className="truncate">
           {hasVoice
-            ? (char.voice_label ?? char.voice_type)
+            ? (char.voice_label ?? t(`books.voiceTypes.${char.voice_type}`, { defaultValue: char.voice_type ?? '' }))
             : t('books.overview.assignVoice')}
         </span>
       </Button>
@@ -171,7 +169,7 @@ function CharCard({ char, selected, onToggle, onDrillIn }: CharCardProps) {
 /** Per-chapter progress state derived from SSE events. */
 interface ChapterProgress {
   /** 'generating' while in-flight; 'done' when complete; undefined otherwise. */
-  status?: 'generating' | 'done';
+  status?: string;
   completed: number;
   total: number;
   errors: number;
@@ -184,9 +182,12 @@ interface ChapterRowProps {
   onGenerate: (chapterId: string) => void;
   progress?: ChapterProgress;
   isGenerating?: boolean;
+  selected?: boolean;
+  onToggle?: (id: string) => void;
+  onPlay?: (id: string) => void;
 }
 
-function ChapterRow({ chapter, index, onEdit, onGenerate, progress, isGenerating }: ChapterRowProps) {
+function ChapterRow({ chapter, index, onEdit, onGenerate, progress, isGenerating, selected, onToggle, onPlay }: ChapterRowProps) {
   const { t } = useTranslation();
   const rowNum = index + 1;
 
@@ -201,30 +202,31 @@ function ChapterRow({ chapter, index, onEdit, onGenerate, progress, isGenerating
   // - SSE 'generating' progress → show 'generating n/m'
   // - Otherwise fall back to stored generation_state
   const effectiveBadgeState =
-    progress?.status === 'done' ? 'done' :
-    progress?.status === 'generating' ? 'generating' :
-    chapter.generation_state;
+    progress?.status ?? chapter.generation_state;
 
   // Badge label including progress counts while in-flight
   const badgeLabel =
     progress?.status === 'generating'
-      ? `generating ${progress.completed}/${progress.total}`
-      : effectiveBadgeState;
+      ? t('books.overview.generationProgress', { completed: progress.completed, total: progress.total })
+      : t(`books.overview.generationState.${effectiveBadgeState}`, { defaultValue: effectiveBadgeState });
 
   // Playable indicator: show play control when done
-  const isDone = effectiveBadgeState === 'done' || chapter.generation_state === 'ready';
+  const isDone = effectiveBadgeState === 'done' || effectiveBadgeState === 'ready' || chapter.generation_state === 'ready';
 
   // Show retry affordance when errors exist (non-crash)
-  const hasErrors = (progress?.errors ?? 0) > 0;
+  const hasErrors = (progress?.errors ?? 0) > 0 || chapter.generation_state === 'error';
 
   return (
-    <div className="flex items-center justify-between py-2 px-1 rounded hover:bg-accent/40 transition-colors">
-      <div>
+    <div className="flex flex-wrap items-center justify-between gap-2 py-2 px-1 rounded hover:bg-accent/40 transition-colors">
+      <div className="flex items-center gap-2 min-w-0">
+        {onToggle && <Checkbox checked={selected} onCheckedChange={() => onToggle(chapter.id)} aria-label={t('books.overview.selectChapter', { number: chapter.number })} />}
+        <div>
         <div className="font-medium text-sm">
           {chapter.number} · {chapter.title}
         </div>
         <div className="text-xs text-muted-foreground">
-          {fmtNumber(chapter.word_count)} words
+          {t('books.overview.words', { count: chapter.word_count })}
+        </div>
         </div>
       </div>
       <div className="flex items-center gap-1.5">
@@ -237,12 +239,7 @@ function ChapterRow({ chapter, index, onEdit, onGenerate, progress, isGenerating
         </Badge>
         {/* Play control: shown when chapter is playable (done/ready) */}
         {isDone && (
-          <span
-            aria-label={`play-chapter-${rowNum}`}
-            className="text-green-400 text-sm select-none"
-          >
-            ▶
-          </span>
+          <Button variant="ghost" size="sm" aria-label={t('books.overview.playChapter', { number: rowNum })} data-testid={`play-chapter-${rowNum}`} onClick={() => onPlay?.(chapter.id)}>▶</Button>
         )}
         {/* Retry affordance on errors — non-crash indicator */}
         {hasErrors && (
@@ -297,6 +294,12 @@ export function BookOverview() {
   const mergeCharacter = useMergeCharacter();
   const deleteCharacter = useDeleteCharacter();
   const generateChapter = useGenerateChapter();
+  const generateBook = useGenerateBook();
+  const analyzeBook = useAnalyzeBook();
+  const { data: generationStatus } = useBookGenerationStatus(selectedBookId);
+  const [selectedChapterIds, setSelectedChapterIds] = useState<Set<string>>(new Set());
+  const [concurrency, setConcurrency] = useState(2);
+  const requestChapterPlayback = useBooksStore((s) => s.requestChapterPlayback);
 
   // Cast selection state (non-narrator ids)
   const [selectedCharIds, setSelectedCharIds] = useState<Set<string>>(new Set());
@@ -306,6 +309,14 @@ export function BookOverview() {
   const [chapterProgress, setChapterProgress] = useState<Record<string, ChapterProgress>>({});
   // Set of chapter IDs currently being generated (for disabling the button)
   const [generatingChapterIds, setGeneratingChapterIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!generationStatus) return;
+    setChapterProgress(Object.fromEntries(generationStatus.chapters.map((chapter) => [chapter.chapter_id, {
+      status: chapter.state, completed: chapter.completed, total: chapter.total, errors: chapter.errors,
+    }])));
+    setGeneratingChapterIds(new Set(generationStatus.chapters.filter((chapter) => ['generating', 'pending', 'queued'].includes(chapter.state)).map((chapter) => chapter.chapter_id)));
+  }, [generationStatus]);
 
   // ── Subscribe to per-book SSE for generation events ──────────────────────
   useBookProgress(selectedBookId ?? '', {
@@ -320,11 +331,15 @@ export function BookOverview() {
     },
     onGenerationComplete: (event: GenerationCompleteEvent) => {
       const chapter_id = event.chapter_id;
-      if (!chapter_id) return;
+      if (!chapter_id) {
+        setGeneratingChapterIds(new Set());
+        if (selectedBookId) void queryClient.invalidateQueries({ queryKey: ['books', selectedBookId] });
+        return;
+      }
       // Flip row to 'done' playable state
       setChapterProgress((prev) => ({
         ...prev,
-        [chapter_id]: { ...(prev[chapter_id] ?? { completed: 0, errors: 0, total: 0 }), status: 'done' },
+        [chapter_id]: { ...(prev[chapter_id] ?? { completed: 0, errors: 0, total: 0 }), status: (prev[chapter_id]?.errors ?? 0) > 0 ? 'partial' : 'done' },
       }));
       // Remove from in-flight set
       setGeneratingChapterIds((prev) => {
@@ -376,7 +391,7 @@ export function BookOverview() {
     // Mark as in-flight to disable the button
     setGeneratingChapterIds((prev) => new Set([...prev, chapterId]));
     try {
-      await generateChapter.mutateAsync({ bookId: selectedBookId, chapterId });
+      await generateChapter.mutateAsync({ bookId: selectedBookId, chapterId, data: { overwrite_errors: true } });
     } catch (err: unknown) {
       // Surface 409 gracefully — book already generating.
       // apiClient throws plain Error with message like "HTTP error! status: 409",
@@ -406,6 +421,34 @@ export function BookOverview() {
         return next;
       });
     }
+  }
+
+  function handleToggleChapter(id: string) {
+    setSelectedChapterIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  async function handleGenerateBook(chapterIds?: string[]) {
+    if (!selectedBookId) return;
+    const ids = chapterIds ?? chapters.map((chapter) => chapter.id);
+    setGeneratingChapterIds(new Set(ids));
+    try {
+      await generateBook.mutateAsync({ bookId: selectedBookId, data: {
+        chapter_ids: chapterIds, concurrency, overwrite_errors: true,
+      } });
+      toast({ title: t('books.overview.toast.queued'), description: t('books.overview.toast.queuedDesc', { count: ids.length }) });
+    } catch (error) {
+      setGeneratingChapterIds(new Set());
+      toast({ title: t('books.overview.toast.generateFailed'), description: error instanceof Error ? error.message : String(error), variant: 'destructive' });
+    }
+  }
+
+  function handleAnalyze() {
+    if (!selectedBookId) return;
+    analyzeBook.mutate({ bookId: selectedBookId, opts: { model_size: '1.7B' } }, { onSuccess: () => setView('analysis') });
   }
 
   async function handleMerge() {
@@ -472,10 +515,11 @@ export function BookOverview() {
 
   return (
     <div className="flex flex-col gap-4 h-full min-h-0">
+      <Button variant="ghost" size="sm" className="self-start" onClick={() => setView('library')}>← {t('books.overview.backToLibrary')}</Button>
       {/* ── Book header ────────────────────────────────────────────────── */}
       <Card data-testid="book-header" className="shrink-0">
         <CardContent className="p-4">
-          <div className="flex items-start gap-4">
+          <div className="flex flex-wrap items-start gap-4">
             {/* Cover placeholder */}
             <div
               className="w-[72px] h-[104px] rounded-md shrink-0 bg-muted border border-border"
@@ -523,7 +567,7 @@ export function BookOverview() {
             </div>
             {/* Phase-D action slots */}
             <div className="flex flex-col items-end gap-1.5 shrink-0">
-              <Button disabled data-testid="generate-all-btn">
+              <Button disabled={!characters.length || generateBook.isPending || generatingChapterIds.size > 0} onClick={() => handleGenerateBook()} data-testid="generate-all-btn">
                 {t('books.overview.generateAll')}
               </Button>
               <Button
@@ -533,9 +577,7 @@ export function BookOverview() {
               >
                 {t('books.overview.export')}
               </Button>
-              <Button variant="ghost" disabled data-testid="audio-settings-btn">
-                {t('books.overview.audioSettings')} ▾
-              </Button>
+              <Badge variant="secondary" data-testid="audio-settings-btn">{t('books.overview.defaultEngine')}</Badge>
             </div>
           </div>
         </CardContent>
@@ -545,7 +587,7 @@ export function BookOverview() {
       {/* flex-1 min-h-0 lets the row consume the height left by the header and
           allows the inner rosters to scroll instead of clipping (issue: long
           cast / chapter lists had no scrollbar). */}
-      <div className="flex gap-4 items-stretch flex-1 min-h-0">
+      <div className="flex flex-col lg:flex-row gap-4 items-stretch flex-1 min-h-0">
         {/* Cast panel */}
         <Card className="flex-1 flex flex-col min-h-0" data-testid="cast-summary">
           <CardContent className="p-4 flex flex-col min-h-0 flex-1">
@@ -576,6 +618,7 @@ export function BookOverview() {
               {t('books.overview.castHint')}
             </p>
             <div className="flex flex-col overflow-y-auto min-h-0 flex-1 -mr-2 pr-2" data-testid="cast-roster">
+              {!characters.length && <div className="flex flex-col gap-3 p-3 text-sm text-muted-foreground"><p>{t('books.overview.noCharacters')}</p><Button onClick={handleAnalyze} disabled={analyzeBook.isPending}>{t('books.overview.analyze')}</Button></div>}
               {characters.map((char) => (
                 <CharCard
                   key={char.id}
@@ -595,6 +638,12 @@ export function BookOverview() {
             <h2 className="text-lg font-semibold mb-3 shrink-0">
               {t('books.overview.chapters')}
             </h2>
+            <div className="flex flex-wrap items-center gap-3 mb-3">
+              <label className="flex items-center gap-2 text-sm"><Checkbox checked={chapters.length > 0 && selectedChapterIds.size === chapters.length} onCheckedChange={(checked) => setSelectedChapterIds(checked ? new Set(chapters.map((c) => c.id)) : new Set())} />{t('books.overview.selectAll')}</label>
+              <label className="flex items-center gap-2 text-sm">{t('books.overview.concurrency')}<select className="rounded border bg-background px-2 py-1" value={concurrency} onChange={(e) => setConcurrency(Number(e.target.value))}>{[1,2,3,4].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+              <Button size="sm" variant="secondary" data-testid="generate-selected-btn" disabled={!selectedChapterIds.size || !characters.length || generatingChapterIds.size > 0 || generateBook.isPending} onClick={() => handleGenerateBook([...selectedChapterIds])}>{t('books.overview.generateSelected', { count: selectedChapterIds.size })}</Button>
+            </div>
+            <p className="text-xs text-muted-foreground mb-3">{t('books.overview.queueHint', { count: concurrency })}</p>
             <div className="flex flex-col overflow-y-auto min-h-0 flex-1 -mr-2 pr-2">
               {chapters.map((chapter, index) => (
                 <ChapterRow
@@ -603,8 +652,11 @@ export function BookOverview() {
                   index={index}
                   onEdit={handleEditChapter}
                   onGenerate={handleGenerateChapter}
+                  selected={selectedChapterIds.has(chapter.id)}
+                  onToggle={handleToggleChapter}
+                  onPlay={(id) => { requestChapterPlayback(id); handleEditChapter(id); }}
                   progress={chapterProgress[chapter.id]}
-                  isGenerating={generatingChapterIds.has(chapter.id)}
+                  isGenerating={generatingChapterIds.has(chapter.id) || !characters.length}
                 />
               ))}
             </div>

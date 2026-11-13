@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Ebook ingestion — format-dispatched parsers producing normalized chapters.
 
 Supports: EPUB (via ebooklib), FB2 (via lxml), TXT (via chardet), PDF (via PyMuPDF).
@@ -10,6 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
 from lxml import etree
 
 # Hardened XML parser: disallows entity resolution, DTD loading, and network access.
@@ -48,6 +50,7 @@ class ParsedBook:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def parse_book(path: str, source_format: str) -> ParsedBook:
     """Dispatch to format-specific parser and return a normalised ParsedBook.
 
@@ -62,60 +65,100 @@ def parse_book(path: str, source_format: str) -> ParsedBook:
         IngestionError: If the format is unsupported or the file is corrupt/unreadable.
     """
     fmt = source_format.lower().lstrip(".")
+    parser = {"epub": _parse_epub, "fb2": _parse_fb2, "txt": _parse_txt, "pdf": _parse_pdf}.get(fmt)
+    if parser is None:
+        raise IngestionError(f"Unsupported format: {source_format!r}")
     try:
-        if fmt == "epub":
-            return _parse_epub(path)
-        if fmt == "fb2":
-            return _parse_fb2(path)
-        if fmt == "txt":
-            return _parse_txt(path)
-        if fmt == "pdf":
-            return _parse_pdf(path)
+        parsed = parser(path)
+        # Apply the same hard chapter bound to every supported format.
+        bounded: list[ParsedChapter] = []
+        for chapter in parsed.chapters:
+            _append_chapter(bounded, chapter.title, chapter.text)
+        parsed.chapters = bounded
+        return parsed
     except IngestionError:
         raise
-    except Exception as exc:  # corrupt / unreadable
+    except Exception as exc:
         raise IngestionError(f"Failed to parse {fmt!r}: {exc}") from exc
-    raise IngestionError(f"Unsupported format: {source_format!r}")
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# Chinese novels frequently have no spaces or blank lines between chapters.
 _CHAPTER_RE = re.compile(
-    r"^\s*(chapter|глава|part|часть)\b.*$",
+    r"^[ \t\u3000]*(?:(?:chapter|глава|part|часть)\b[^\n]{0,110}|"
+    r"第[零〇一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟0-9０-９]+[章回节卷部篇][^\n]{0,90}|"
+    r"(?:序章|楔子|序言|前言|尾声|后记|终章|番外)(?:[ \t：:、.][^\n]{0,90})?)[ \t\u3000]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+MAX_CHAPTER_CHARS = 20_000
+
+
+def count_text_units(text: str) -> int:
+    """Chinese characters plus space-delimited words, for useful word counts."""
+    return len(
+        re.findall(
+            r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]|[A-Za-z0-9\u00c0-\u02af\u0400-\u04ff]+(?:['’-][A-Za-z0-9\u00c0-\u02af\u0400-\u04ff]+)*",
+            text,
+        )
+    )
+
+
+def detect_text_language(text: str) -> str:
+    """Small deterministic ISO language detector shared by analysis and TTS."""
+    sample = text[:16000]
+    cjk = len(re.findall(r"[\u3400-\u9fff]", sample))
+    kana = len(re.findall(r"[\u3040-\u30ff]", sample))
+    hangul = len(re.findall(r"[\uac00-\ud7af]", sample))
+    cyrillic = len(re.findall(r"[\u0400-\u04ff]", sample))
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    if kana >= 2 and kana * 4 >= cjk:
+        return "ja"
+    if hangul >= 2 and hangul > max(cjk, latin // 2):
+        return "ko"
+    if cjk >= 2 and cjk * 3 >= latin:
+        return "zh"
+    if cyrillic >= 2 and cyrillic > latin:
+        return "ru"
+    return "en"
+
+
+def _append_chapter(chapters: list[ParsedChapter], title: str | None, body: str) -> None:
+    """Automatically fragment a large natural chapter, retaining every character."""
+    body = _clean(body)
+    if not body:
+        return
+    parts = []
+    while len(body) > MAX_CHAPTER_CHARS:
+        window = body[:MAX_CHAPTER_CHARS]
+        boundaries = [m.end() for m in re.finditer(r"\n|[。！？!?]", window) if m.end() >= MAX_CHAPTER_CHARS // 2]
+        end = boundaries[-1] if boundaries else MAX_CHAPTER_CHARS
+        parts.append(body[:end].strip())
+        body = body[end:].lstrip()
+    if body:
+        parts.append(body)
+    for part_idx, part in enumerate(parts):
+        part_title = title
+        if len(parts) > 1:
+            part_title = f"{title or '正文'}（{part_idx + 1}/{len(parts)}）"
+        chapters.append(
+            ParsedChapter(number=len(chapters) + 1, title=part_title, text=part, word_count=count_text_units(part))
+        )
 
 
 def _split_into_chapters(text: str, default_title: str | None = None) -> list[ParsedChapter]:
-    """Split *text* on chapter-heading lines (or return as a single chapter)."""
-    # Use finditer to preserve chapter titles (split() drops separators with no capturing groups).
+    """Keep front matter and heading text; impose a hard upper bound per part."""
     matches = list(_CHAPTER_RE.finditer(text))
-
-    if not matches:
-        # No headings — whole file is one chapter.
-        clean = _clean(text)
-        chapter = ParsedChapter(
-            number=1,
-            title=default_title,
-            text=clean,
-            word_count=len(clean.split()) if clean else 0,
-        )
-        return [chapter]
-
     chapters: list[ParsedChapter] = []
+    if not matches:
+        _append_chapter(chapters, default_title, text)
+        return chapters
+    _append_chapter(chapters, "序言", text[: matches[0].start()])
     for idx, match in enumerate(matches):
-        start = match.end()
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        body = text[start:end]
-        clean = _clean(body)
-        chapters.append(ParsedChapter(
-            number=idx + 1,
-            title=match.group(0).strip(),
-            text=clean,
-            word_count=len(clean.split()) if clean else 0,
-        ))
+        _append_chapter(chapters, match.group(0).strip(), text[match.start() : end])
     return chapters
 
 
@@ -141,8 +184,7 @@ def _strip_html(html_bytes: bytes | str) -> str:
     html_str = re.sub(r"<[^>]+>", "", html_str)
     # Decode common HTML entities
     html_str = (
-        html_str
-        .replace("&amp;", "&")
+        html_str.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&nbsp;", " ")
@@ -156,6 +198,7 @@ def _strip_html(html_bytes: bytes | str) -> str:
 # ---------------------------------------------------------------------------
 # EPUB parser
 # ---------------------------------------------------------------------------
+
 
 def _parse_epub(path: str) -> ParsedBook:
     import ebooklib
@@ -188,7 +231,7 @@ def _parse_epub(path: str) -> ParsedBook:
     # EpubNav items have get_type() == ITEM_NAVIGATION; however, ebooklib sometimes
     # reports them as ITEM_DOCUMENT after a round-trip.  Filtering by the class type
     # or by file name containing "nav" is more reliable.
-    from ebooklib.epub import EpubNav  # noqa: PLC0415
+    from ebooklib.epub import EpubNav
 
     chapters: list[ParsedChapter] = []
     chapter_num = 0
@@ -211,12 +254,14 @@ def _parse_epub(path: str) -> ParsedBook:
         if not text:
             continue
         chapter_num += 1
-        chapters.append(ParsedChapter(
-            number=chapter_num,
-            title=item.get_name(),
-            text=text,
-            word_count=len(text.split()),
-        ))
+        chapters.append(
+            ParsedChapter(
+                number=chapter_num,
+                title=item.get_name(),
+                text=text,
+                word_count=count_text_units(text),
+            )
+        )
 
     return ParsedBook(
         title=title,
@@ -296,12 +341,14 @@ def _parse_fb2(path: str) -> ParsedBook:
                 if ptext:
                     lines.append(ptext)
             text = _clean("\n\n".join(lines))
-            chapters.append(ParsedChapter(
-                number=idx + 1,
-                title=chapter_title,
-                text=text,
-                word_count=len(text.split()) if text else 0,
-            ))
+            chapters.append(
+                ParsedChapter(
+                    number=idx + 1,
+                    title=chapter_title,
+                    text=text,
+                    word_count=count_text_units(text),
+                )
+            )
 
     return ParsedBook(
         title=title,
@@ -315,31 +362,69 @@ def _parse_fb2(path: str) -> ParsedBook:
 # TXT parser
 # ---------------------------------------------------------------------------
 
+
 def _parse_txt(path: str) -> ParsedBook:
+    import codecs
+
     import chardet
 
-    raw = Path(path).read_bytes()
-    detected = chardet.detect(raw)
-    encoding = detected.get("encoding") or "utf-8"
+    with Path(path).open("rb") as stream:
+        sample = stream.read(1_048_576)
+    detected = chardet.detect(sample).get("encoding") or "utf-8"
+    if detected.lower().replace("-", "") in {"gb2312", "gbk"}:
+        detected = "gb18030"
+    # Prefer valid UTF-8 over a heuristic encoding guess, including a BOM.
     try:
-        text = raw.decode(encoding)
-    except (UnicodeDecodeError, LookupError):
-        text = raw.decode("utf-8", errors="replace")
-
+        codecs.getincrementaldecoder("utf-8-sig")().decode(sample, final=False)
+        encodings = ["utf-8-sig", detected, "gb18030"]
+    except UnicodeDecodeError:
+        encodings = [detected, "gb18030", "utf-8-sig"]
     title = Path(path).stem
-    chapters = _split_into_chapters(text, default_title=title)
-
-    return ParsedBook(
-        title=title,
-        author=None,
-        source_format="txt",
-        chapters=chapters,
-    )
+    for encoding in dict.fromkeys(encodings):
+        chapters: list[ParsedChapter] = []
+        parts: list[str] = []
+        current_title: str | None = title
+        part_size = 0
+        try:
+            # Decode progressively; a giant text file never needs a second full
+            # raw-byte copy, and oversized chapters flush into bounded parts.
+            with Path(path).open("r", encoding=encoding, newline=None) as stream:
+                for line in stream:
+                    if _CHAPTER_RE.fullmatch(line.rstrip("\r\n")):
+                        _append_chapter(chapters, current_title, "".join(parts))
+                        parts, part_size = [], 0
+                        current_title = line.strip()
+                    # A single unbroken line may itself be larger than a part.
+                    for offset in range(0, len(line), MAX_CHAPTER_CHARS):
+                        piece = line[offset : offset + MAX_CHAPTER_CHARS]
+                        if part_size + len(piece) > MAX_CHAPTER_CHARS and parts:
+                            _append_chapter(chapters, current_title, "".join(parts))
+                            parts, part_size = [], 0
+                        parts.append(piece)
+                        part_size += len(piece)
+            _append_chapter(chapters, current_title, "".join(parts))
+            # Repeated fragments of one source chapter remain distinguishable.
+            title_counts: dict[str | None, int] = {}
+            for chapter in chapters:
+                title_counts[chapter.title] = title_counts.get(chapter.title, 0) + 1
+            title_indexes: dict[str | None, int] = {}
+            for chapter in chapters:
+                natural_title = chapter.title
+                if title_counts[natural_title] > 1:
+                    title_indexes[natural_title] = title_indexes.get(natural_title, 0) + 1
+                    chapter.title = (
+                        f"{natural_title or '正文'}（{title_indexes[natural_title]}/{title_counts[natural_title]}）"
+                    )
+            return ParsedBook(title=title, author=None, source_format="txt", chapters=chapters)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    raise IngestionError("无法识别小说文本编码，请将文件另存为 UTF-8 后上传。")
 
 
 # ---------------------------------------------------------------------------
 # PDF parser
 # ---------------------------------------------------------------------------
+
 
 def _parse_pdf(path: str) -> ParsedBook:
     """Best-effort PDF text extraction with header/footer stripping and de-hyphenation."""
@@ -367,9 +452,7 @@ def _parse_pdf(path: str) -> ParsedBook:
                 continue
             for line in block.get("lines", []):
                 y = round(line["bbox"][1])  # top-y coordinate rounded to int
-                line_text = " ".join(
-                    span["text"] for span in line.get("spans", [])
-                ).strip()
+                line_text = " ".join(span["text"] for span in line.get("spans", [])).strip()
                 if line_text:
                     lines_on_page.append((y, line_text))
         page_lines.append(lines_on_page)
@@ -379,6 +462,7 @@ def _parse_pdf(path: str) -> ParsedBook:
     # Identify repeated y-positions (header/footer heuristic: same y on ≥50% of pages)
     if num_pages >= 2:
         from collections import Counter
+
         y_counts: Counter[int] = Counter()
         for lines in page_lines:
             for y, _ in lines:

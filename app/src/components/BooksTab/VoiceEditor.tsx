@@ -25,6 +25,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { useCharacters, usePreviewCharacter, useUpdateCharacter, useVoiceOptions, useCloneVoiceForCharacter, useSaveVoiceToLibrary } from '@/lib/hooks/useBooks';
 import { useAudioRecording } from '@/lib/hooks/useAudioRecording';
+import type { VoiceDesignPrompt } from '@/lib/api/types';
 import { apiClient } from '@/lib/api/client';
 import { cn } from '@/lib/utils/cn';
 import { useBooksStore } from '@/stores/booksStore';
@@ -224,7 +225,7 @@ function CloneTabBody({
   // confirmedFile holds the trimmed File returned by AudioTrimmer onConfirm;
   // cleared whenever a new raw sample is loaded.
   const [confirmedFile, setConfirmedFile] = useState<File | null>(null);
-  const [voiceName, setVoiceName] = useState(`${charName} (cloned)`);
+  const [voiceName, setVoiceName] = useState(t('books.voiceEditor.cloneVoiceNamePlaceholder', { name: charName }));
   const [transcriptText, setTranscriptText] = useState('');
   const transcript = useReferenceTranscript({
     file: confirmedFile,
@@ -327,14 +328,14 @@ function CloneTabBody({
       const profile = await cloneVoice.mutateAsync({
         bookId,
         charId,
-        name: voiceName || `${charName} (cloned)`,
+        name: voiceName || t('books.voiceEditor.cloneVoiceNamePlaceholder', { name: charName }),
         file: fileToUpload,
         referenceText: transcriptText,
       });
       setClonedProfileId(profile.id);
       onCloned(profile.id);
     } catch (err) {
-      setCloneError(err instanceof Error ? err.message : 'Clone failed');
+      setCloneError(err instanceof Error ? err.message : t('books.voiceEditor.cloneFailed'));
     }
   }
 
@@ -535,7 +536,7 @@ function LibraryTabBody({
     id: (p as unknown as { voice_id: string }).voice_id ?? (p as unknown as { id?: string }).id ?? '',
     name: p.name,
     gender: p.gender,
-    engine: 'kokoro',
+    engine: (p as unknown as { engine?: string }).engine ?? 'Qwen',
     accent: p.language,
   }));
 
@@ -659,12 +660,12 @@ function LibraryTabBody({
         ) : (
           filteredLibrary.map((v) => {
             const candidate: LibraryCandidate = { kind: 'profile', id: v.id };
-            const metaParts = [v.gender, v.age_range].filter(Boolean);
+            const metaParts = [v.gender ? t(`books.gender.${v.gender}`, { defaultValue: v.gender }) : undefined, v.age_range].filter(Boolean);
             return (
               <VoiceCard
                 key={v.id}
                 name={v.name}
-                badge={v.voice_type}
+                badge={v.voice_type ? t(`books.voiceTypes.${v.voice_type}`, { defaultValue: v.voice_type }) : undefined}
                 meta={metaParts.join(' · ')}
                 isSelected={isSelected(candidate)}
                 onSelect={() => handleSelect(candidate)}
@@ -693,12 +694,12 @@ function LibraryTabBody({
         ) : (
           filteredBook.map((v) => {
             const candidate: LibraryCandidate = { kind: 'profile', id: v.id };
-            const metaParts = [v.gender, v.age_range].filter(Boolean);
+            const metaParts = [v.gender ? t(`books.gender.${v.gender}`, { defaultValue: v.gender }) : undefined, v.age_range].filter(Boolean);
             return (
               <VoiceCard
                 key={v.id}
                 name={v.name}
-                badge={v.voice_type}
+                badge={v.voice_type ? t(`books.voiceTypes.${v.voice_type}`, { defaultValue: v.voice_type }) : undefined}
                 meta={metaParts.join(' · ')}
                 isSelected={isSelected(candidate)}
                 onSelect={() => handleSelect(candidate)}
@@ -727,7 +728,7 @@ function LibraryTabBody({
         ) : (
           filteredPresets.map((v) => {
             const candidate: LibraryCandidate = { kind: 'preset', id: v.id };
-            const metaParts = [v.gender, v.accent].filter(Boolean);
+            const metaParts = [v.gender ? t(`books.gender.${v.gender}`, { defaultValue: v.gender }) : undefined, v.accent ? t(`books.languages.${v.accent}`, { defaultValue: v.accent }) : undefined].filter(Boolean);
             return (
               <VoiceCard
                 key={v.id}
@@ -785,11 +786,11 @@ function LibraryTabBody({
 // ─── VoiceEditor ──────────────────────────────────────────────────────────────
 
 interface VoiceEditorProps {
-  /** Override the initially active tab (default: 'design') */
+  /** Override the initially active tab (default: 'library') */
   initialTab?: 'library' | 'clone' | 'design';
 }
 
-export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
+export function VoiceEditor({ initialTab = 'library' }: VoiceEditorProps) {
   const { t } = useTranslation();
 
   // ── Store ─────────────────────────────────────────────────────────────────
@@ -815,10 +816,25 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
 
   // ── Local state ───────────────────────────────────────────────────────────
   const [designPrompt, setDesignPrompt] = useState(character?.vocal_description ?? '');
+  const [activeTab, setActiveTab] = useState(initialTab);
+  const [prompts, setPrompts] = useState<VoiceDesignPrompt[]>([]);
+  const [promptSearch, setPromptSearch] = useState('');
+  const [promptCategory, setPromptCategory] = useState('');
+  const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
+  const [promptLoadError, setPromptLoadError] = useState(false);
+  useEffect(() => {
+    if (activeTab !== 'design' || typeof apiClient.listVoicePrompts !== 'function') return;
+    let cancelled = false;
+    apiClient.listVoicePrompts().then((items) => { if (!cancelled) { setPrompts(items); setPromptLoadError(false); } }).catch(() => { if (!cancelled) setPromptLoadError(true); });
+    return () => { cancelled = true; };
+  }, [activeTab]);
+  const filteredPrompts = prompts.filter((prompt) => (!promptCategory || prompt.category === promptCategory) && (!promptSearch.trim() || `${prompt.name} ${prompt.description} ${prompt.prompt}`.toLocaleLowerCase().includes(promptSearch.trim().toLocaleLowerCase())));
+  const promptCategories = [...new Set(prompts.map((prompt) => prompt.category))].sort();
 
   // Sync design prompt when character changes
   useEffect(() => {
     setDesignPrompt(character?.vocal_description ?? '');
+    setSelectedPromptId(null);
   }, [character?.id, character?.vocal_description]);
 
   // Derive audio URL from preview result
@@ -847,7 +863,7 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
     if (!character) return;
     preview.mutate({
       charId: character.id,
-      data: { design_prompt: designPrompt || undefined },
+      data: selectedPromptId ? { prompt_id: selectedPromptId } : { design_prompt: designPrompt || undefined },
     });
   }
 
@@ -857,7 +873,7 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
       {
         bookId: selectedBookId,
         charId: character.id,
-        data: { design_prompt: designPrompt || undefined },
+        data: selectedPromptId ? { prompt_id: selectedPromptId } : { design_prompt: designPrompt || undefined },
       },
       {
         onSuccess: () => setView('overview'),
@@ -1011,7 +1027,7 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
       </div>
 
       {/* ── Main two-column layout ───────────────────────────────────────── */}
-      <div className="flex gap-4 items-start flex-1 min-h-0">
+      <div className="flex flex-col lg:flex-row gap-4 items-start flex-1 min-h-0">
         {/* LEFT: character context */}
         <Card className="flex-1" data-testid="character-context">
           <CardContent className="pt-4">
@@ -1029,10 +1045,10 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
             <div className="flex flex-wrap gap-1 mb-3">
               {character.gender && character.age_range && (
                 <Badge variant="secondary">
-                  {character.gender} · {character.age_range}
+                  {t(`books.gender.${character.gender}`, { defaultValue: character.gender })} · {character.age_range}
                 </Badge>
               )}
-              <Badge variant="secondary">{character.dialogue_count} lines</Badge>
+              <Badge variant="secondary">{t('books.overview.lines', { count: character.dialogue_count })}</Badge>
               <Badge
                 variant="outline"
                 className={cn(
@@ -1041,7 +1057,7 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
                   confLabel === 'low' && 'border-red-600 text-red-400',
                 )}
               >
-                {t(`books.overview.confidence.${confLabel}`)} {t('books.voiceEditor.confidence')}
+                {t('books.voiceEditor.confidenceLevel', { level: t(`books.overview.confidence.${confLabel}`) })}
               </Badge>
             </div>
 
@@ -1108,12 +1124,12 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
               <h2 className="text-base font-semibold">{t('books.voiceEditor.voiceTitle')}</h2>
               <Badge data-testid="current-voice" variant="outline">
                 {t('books.voiceEditor.currentVoice')}{' '}
-                {character.voice_type ?? t('books.voiceEditor.noVoice')}
+                {character.voice_label ?? (character.voice_type ? t(`books.voiceTypes.${character.voice_type}`, { defaultValue: character.voice_type }) : t('books.voiceEditor.noVoice'))}
               </Badge>
             </div>
 
             {/* Three-tab scaffold */}
-            <Tabs defaultValue={initialTab}>
+            <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as typeof initialTab)}>
               <TabsList className="mb-3">
                 <TabsTrigger value="library">
                   {t('books.voiceEditor.tabLibrary')}
@@ -1152,6 +1168,20 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
 
               {/* Design tab — fully wired in C10 */}
               <TabsContent value="design">
+                <p className="text-xs text-muted-foreground mb-3">{t('books.voiceEditor.breezeHint')}</p>
+                <section className="mb-4 rounded border p-3" aria-label={t('books.voiceEditor.promptLibrary')}>
+                  <h3 className="mb-2 text-sm font-medium">{t('books.voiceEditor.promptLibrary')} <span className="font-normal text-muted-foreground">{t('books.voiceEditor.promptCount', { count: prompts.length })}</span></h3>
+                  <div className="mb-2 flex flex-wrap gap-2">
+                    <Input className="flex-1 min-w-[160px]" value={promptSearch} onChange={(event) => setPromptSearch(event.target.value)} placeholder={t('books.voiceEditor.promptSearch')} aria-label={t('books.voiceEditor.promptSearch')} />
+                    <select className="rounded border bg-background px-2 text-sm" value={promptCategory} onChange={(event) => setPromptCategory(event.target.value)} aria-label={t('books.voiceEditor.promptCategory')}><option value="">{t('books.voiceEditor.promptAllCategories')}</option>{promptCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select>
+                  </div>
+                  {promptLoadError && <p className="text-sm text-destructive">{t('books.voiceEditor.promptLoadError')}</p>}
+                  <div className="max-h-44 overflow-y-auto space-y-1" data-testid="voice-prompt-list">
+                    {filteredPrompts.slice(0, 60).map((prompt) => <button key={prompt.id} type="button" className={cn('w-full rounded p-2 text-left hover:bg-muted', selectedPromptId === prompt.id && 'bg-primary/10 ring-1 ring-primary')} onClick={() => { setSelectedPromptId(prompt.id); setDesignPrompt(prompt.prompt); }}><span className="text-sm font-medium">{prompt.name}</span><span className="ml-2 text-xs text-muted-foreground">{prompt.category}</span><p className="line-clamp-2 text-xs text-muted-foreground">{prompt.description || prompt.prompt}</p></button>)}
+                    {prompts.length > 0 && !filteredPrompts.length && <p className="text-xs text-muted-foreground">{t('books.voiceEditor.libraryEmpty')}</p>}
+                  </div>
+                  {filteredPrompts.length > 60 && <p className="mt-2 text-xs text-muted-foreground">{t('books.voiceEditor.promptRefine', { count: filteredPrompts.length })}</p>}
+                </section>
                 {/* Design prompt textarea */}
                 <div className="mb-3">
                   <label className="text-xs text-muted-foreground mb-1 block">
@@ -1161,11 +1191,12 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
                     data-testid="design-prompt"
                     rows={3}
                     value={designPrompt}
-                    onChange={(e) => setDesignPrompt(e.target.value)}
+                    onChange={(e) => { setDesignPrompt(e.target.value); setSelectedPromptId(null); }}
                     placeholder={t('books.voiceEditor.designPromptPlaceholder')}
                   />
                 </div>
 
+                {(preview.isError || updateCharacter.isError) && <p className="mb-2 text-sm text-destructive" role="alert">{(preview.error ?? updateCharacter.error)?.message ?? t('books.overview.toast.generateFailed')}</p>}
                 {/* Shared preview-player row */}
                 <PreviewPlayer audioSrc={previewAudioSrc} />
 
@@ -1192,7 +1223,7 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
                       variant="secondary"
                       size="sm"
                       onClick={handlePreview}
-                      disabled={preview.isPending}
+                      disabled={preview.isPending || !designPrompt.trim()}
                     >
                       {preview.isPending
                         ? t('books.voiceEditor.generating')
@@ -1202,7 +1233,7 @@ export function VoiceEditor({ initialTab = 'design' }: VoiceEditorProps) {
                       data-testid="assign-voice-btn"
                       size="sm"
                       onClick={handleAssign}
-                      disabled={updateCharacter.isPending}
+                      disabled={updateCharacter.isPending || !designPrompt.trim()}
                     >
                       {t('books.voiceEditor.assignBack')}
                     </Button>

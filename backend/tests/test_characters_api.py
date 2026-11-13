@@ -83,9 +83,9 @@ def setup(tmp_path, monkeypatch):
         id=str(uuid.uuid4()),
         name="Narrator Voice",
         voice_type="preset",
-        preset_engine="kokoro",
-        preset_voice_id="af_heart",
-        default_engine="kokoro",
+        preset_engine="qwen_custom_voice",
+        preset_voice_id="Serena",
+        default_engine="qwen_custom_voice",
         book_id=book.id,
         is_library=False,
         created_at=datetime.utcnow(),
@@ -219,22 +219,28 @@ def test_assign_preset_voice(setup, monkeypatch):
     book_id = setup["book_id"]
     uncast_char_id = setup["uncast_char_id"]
 
-    # Mock the kokoro voices so validation works without model
+    # Mock the Qwen voices so validation works without model
     import backend.services.book_characters as bc_svc
     monkeypatch.setattr(
         bc_svc,
-        "_get_kokoro_voices",
-        lambda: {("af_heart", "Heart", "female", "en")},
+        "_get_qwen_voices",
+        lambda: [("Serena", "Serena", "female", "zh", "温柔女声")],
     )
 
     r = client.patch(
         f"/books/{book_id}/characters/{uncast_char_id}",
-        json={"preset_voice_id": "af_heart"},
+        json={"preset_voice_id": "Serena"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["voice_type"] == "preset"
     assert body["voice_label"] is not None
+    db = setup["TestSession"]()
+    assigned = db.get(VoiceProfile, body["profile_id"])
+    assert assigned.preset_engine == "qwen_custom_voice"
+    assert assigned.default_engine == "qwen_custom_voice"
+    assert assigned.preset_voice_id == "Serena"
+    db.close()
 
 
 def test_assign_preset_voice_unknown_char_404(setup):
@@ -244,7 +250,7 @@ def test_assign_preset_voice_unknown_char_404(setup):
 
     r = client.patch(
         f"/books/{book_id}/characters/{uuid.uuid4()}",
-        json={"preset_voice_id": "af_heart"},
+        json={"preset_voice_id": "Serena"},
     )
     assert r.status_code == 404
 
@@ -476,7 +482,7 @@ def test_preview_with_preset_voice_id_candidate(setup, monkeypatch):
     # Even with no assigned voice, preview should work with a candidate preset
     r = client.post(
         f"/characters/{uncast_char_id}/preview",
-        json={"text": "Preset preview.", "preset_voice_id": "af_heart"},
+        json={"text": "Preset preview.", "preset_voice_id": "Serena"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -570,7 +576,7 @@ def test_cast_char_preview_preset_candidate_drives_generation(setup, monkeypatch
 
     r = client.post(
         f"/characters/{cast_char_id}/preview",
-        json={"text": "Candidate preset.", "preset_voice_id": "af_sky"},
+        json={"text": "Candidate preset.", "preset_voice_id": "Vivian"},
     )
     assert r.status_code == 200, r.text
 
@@ -589,7 +595,9 @@ def test_cast_char_preview_preset_candidate_drives_generation(setup, monkeypatch
     transient = db.get(VoiceProfile, used_profile_id)
     assert transient is not None, f"Transient profile {used_profile_id!r} not found in DB"
     assert transient.voice_type == "preset"
-    assert transient.preset_voice_id == "af_sky"
+    assert transient.preset_voice_id == "Vivian"
+    assert transient.preset_engine == "qwen_custom_voice"
+    assert call_kwargs["engine"] == "qwen_custom_voice"
     db.close()
 
 
@@ -632,6 +640,8 @@ def test_cast_char_preview_design_prompt_candidate_drives_generation(setup, monk
     assert transient is not None, f"Transient profile {used_profile_id!r} not found in DB"
     assert transient.voice_type == "designed"
     assert transient.design_prompt == "a wise elderly storyteller"
+    assert transient.default_engine == "breeze"
+    assert call_kwargs["engine"] == "breeze"
     db.close()
 
 
@@ -654,7 +664,7 @@ def test_cast_char_preview_transient_profiles_are_bounded(setup, monkeypatch):
         )
         r = client.post(
             f"/characters/{cast_char_id}/preview",
-            json={"text": f"Take {i}.", "preset_voice_id": "af_sky"},
+            json={"text": f"Take {i}.", "preset_voice_id": "Vivian"},
         )
         assert r.status_code == 200, r.text
 
@@ -670,4 +680,155 @@ def test_cast_char_preview_transient_profiles_are_bounded(setup, monkeypatch):
         f"Expected at most 2 _preview_* profiles but found {len(preview_profiles)}: "
         f"{[p.name for p in preview_profiles]}"
     )
+    db.close()
+
+
+def test_voice_options_include_global_qwen_without_library_flag(setup):
+    db = setup["TestSession"]()
+    global_voice = VoiceProfile(name="已有Qwen声音", voice_type="preset", preset_engine="qwen_custom_voice",
+                                preset_voice_id="Dylan", default_engine="qwen_custom_voice", is_library=False)
+    db.add(global_voice)
+    db.commit()
+    global_id = global_voice.id
+    db.close()
+    response = setup["client"].get(f"/books/{setup['book_id']}/voice-options")
+    assert response.status_code == 200
+    data = response.json()
+    assert global_id in {p["id"] for p in data["library"]}
+    assert {p["engine"] for p in data["presets"]} == {"qwen_custom_voice"}
+    assert len(data["presets"]) == 9
+    assert all(p["description"] for p in data["presets"])
+
+
+def test_unknown_or_kokoro_preset_cannot_be_newly_assigned(setup):
+    response = setup["client"].patch(
+        f"/books/{setup['book_id']}/characters/{setup['uncast_char_id']}",
+        json={"preset_voice_id": "af_heart"},
+    )
+    assert response.status_code == 400
+    assert "Qwen" in response.json()["detail"]
+
+
+def test_character_preview_defaults_to_chinese_and_assigned_voice(setup, monkeypatch):
+    captured = MagicMock(return_value=AsyncMock())
+    monkeypatch.setattr("backend.services.book_characters.run_generation", captured)
+    monkeypatch.setattr("backend.services.book_characters.enqueue_generation", MagicMock())
+    monkeypatch.setattr("backend.services.book_characters.get_task_manager", MagicMock(return_value=MagicMock()))
+    response = setup["client"].post(f"/characters/{setup['narrator_id']}/preview", json={})
+    assert response.status_code == 200
+    kwargs = captured.call_args.kwargs
+    assert kwargs["language"] == "zh"
+    assert kwargs["engine"] == "qwen_custom_voice"
+    db = setup["TestSession"]()
+    assert kwargs["profile_id"] == db.get(BookCharacter, setup["narrator_id"]).profile_id
+    db.close()
+
+
+def test_catalogue_prompt_assignment_and_preview_keep_breeze_engine(setup, monkeypatch):
+    from backend.database.models import VoiceDesignPrompt
+
+    db = setup["TestSession"]()
+    db.add(VoiceDesignPrompt(id="catalogue-test", name="沉稳旁白", prompt="温暖醇厚的成年男声", category="旁白", language="zh"))
+    db.commit()
+    db.close()
+    base = f"/books/{setup['book_id']}/characters/{setup['uncast_char_id']}"
+    response = setup["client"].patch(base, json={"prompt_id": "catalogue-test"})
+    assert response.status_code == 200
+    assigned_id = response.json()["profile_id"]
+    db = setup["TestSession"]()
+    assigned = db.get(VoiceProfile, assigned_id)
+    assert assigned.voice_type == "designed"
+    assert assigned.default_engine == "breeze"
+    assert assigned.design_prompt == "温暖醇厚的成年男声"
+    db.close()
+    captured = MagicMock(return_value=AsyncMock())
+    monkeypatch.setattr("backend.services.book_characters.run_generation", captured)
+    monkeypatch.setattr("backend.services.book_characters.enqueue_generation", MagicMock())
+    monkeypatch.setattr("backend.services.book_characters.get_task_manager", MagicMock(return_value=MagicMock()))
+    response = setup["client"].post(f"/characters/{setup['uncast_char_id']}/preview", json={"prompt_id": "catalogue-test"})
+    assert response.status_code == 200
+    assert captured.call_args.kwargs["engine"] == "breeze"
+    db = setup["TestSession"]()
+    assert db.get(BookCharacter, setup["uncast_char_id"]).profile_id == assigned_id
+    db.close()
+
+
+def test_preview_reuses_candidate_and_does_not_delete_other_active_previews(setup, monkeypatch):
+    _mock_preview_deps(monkeypatch)
+    client = setup["client"]
+    for char_id, speaker in [(setup["cast_char_id"], "Serena"), (setup["uncast_char_id"], "Vivian"), (setup["cast_char_id"], "Serena")]:
+        response = client.post(f"/characters/{char_id}/preview", json={"preset_voice_id": speaker})
+        assert response.status_code == 200
+    db = setup["TestSession"]()
+    candidates = db.query(VoiceProfile).filter(VoiceProfile.name.like("_preview_%")).all()
+    assert len(candidates) == 2
+    generations = db.query(Generation).filter_by(source="book_preview").all()
+    assert len(generations) == 3
+    assert generations[0].profile_id == generations[2].profile_id
+    assert db.get(VoiceProfile, generations[1].profile_id) is not None
+    db.close()
+
+
+def test_finished_candidate_cleanup_removes_samples_and_audio(setup, monkeypatch):
+    from backend import config
+    from backend.database import ProfileSample
+
+    _mock_preview_deps(monkeypatch)
+    client = setup["client"]
+    char_id = setup["uncast_char_id"]
+    first = client.post(f"/characters/{char_id}/preview", json={"design_prompt": "温柔女性声音"})
+    assert first.status_code == 200
+    db = setup["TestSession"]()
+    generation = db.get(Generation, first.json()["generation_id"])
+    old_profile = db.get(VoiceProfile, generation.profile_id)
+    old_id = old_profile.id
+    assert old_profile.language == "zh"
+    generation.status = "completed"
+    output = config.get_data_dir() / "generations" / "preview.wav"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b"generated-audio")
+    generation.audio_path = config.to_storage_path(output)
+    anchor = config.get_profiles_dir() / old_id / "designed-anchor.wav"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.write_bytes(b"anchor-audio")
+    db.add(ProfileSample(profile_id=old_id, audio_path=config.to_storage_path(anchor), reference_text="参考文本"))
+    db.commit()
+    db.close()
+    second = client.post(f"/characters/{char_id}/preview", json={"design_prompt": "低沉男性声音"})
+    assert second.status_code == 200
+    db = setup["TestSession"]()
+    assert db.get(VoiceProfile, old_id) is None
+    assert db.query(ProfileSample).filter_by(profile_id=old_id).count() == 0
+    assert not anchor.exists()
+    assert not output.exists()
+    db.close()
+
+
+def test_changing_profile_invalidates_existing_audio_across_chapters_only(setup):
+    from backend.database import BookSegment, Chapter
+
+    db = setup["TestSession"]()
+    char_id = setup["uncast_char_id"]
+    rendered = []
+    for number in (1, 2):
+        chapter = Chapter(book_id=setup["book_id"], number=number, raw_text="台词")
+        db.add(chapter)
+        db.flush()
+        old_generation = Generation(profile_id=setup["cast_char_profile_id"], text="台词", language="zh", audio_path="old.wav", duration=1, status="completed")
+        db.add(old_generation)
+        db.flush()
+        segment = BookSegment(chapter_id=chapter.id, character_id=char_id, type="dialogue", order=0, text="台词", generation_id=old_generation.id, audio_status="completed")
+        db.add(segment)
+        db.flush()
+        rendered.append(segment.id)
+    untouched = BookSegment(chapter_id=chapter.id, character_id=char_id, type="dialogue", order=1, text="尚未生成", audio_status="none")
+    db.add(untouched)
+    db.commit()
+    untouched_id = untouched.id
+    db.close()
+    response = setup["client"].patch(f"/books/{setup['book_id']}/characters/{char_id}", json={"preset_voice_id": "Serena"})
+    assert response.status_code == 200
+    db = setup["TestSession"]()
+    assert all(db.get(BookSegment, segment_id).audio_status == "stale" for segment_id in rendered)
+    assert db.get(BookSegment, untouched_id).audio_status == "none"
     db.close()

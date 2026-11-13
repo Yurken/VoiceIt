@@ -67,6 +67,9 @@ def init_db() -> None:
 
     backfill_generation_versions(SessionLocal, Generation, GenerationVersion)
     seed_builtin_presets(SessionLocal, EffectPreset)
+    from ..services.voice_prompts import seed_voice_prompts
+    with SessionLocal() as db:
+        seed_voice_prompts(db)
 
 
 def get_db():

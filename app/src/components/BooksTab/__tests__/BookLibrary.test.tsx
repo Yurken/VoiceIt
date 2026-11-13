@@ -76,7 +76,7 @@ describe('BookLibrary', () => {
     expect(useBooksStore.getState().view).toBe('analysis');
   });
 
-  it('clicking an imported book navigates to analysis view', () => {
+  it('clicking an imported book opens overview so analysis can be started', () => {
     (useBooks as unknown as Mock).mockReturnValue({
       data: [{ id: 'b3', title: 'Horizon Zero', author: 'M. Tanaka', status: 'imported', chapter_count: 8 }],
       isLoading: false,
@@ -84,7 +84,7 @@ describe('BookLibrary', () => {
     render(wrap(<BookLibrary />));
     fireEvent.click(screen.getByText('Horizon Zero'));
     expect(useBooksStore.getState().selectedBookId).toBe('b3');
-    expect(useBooksStore.getState().view).toBe('analysis');
+    expect(useBooksStore.getState().view).toBe('overview');
   });
 
   it('shows loading state', () => {

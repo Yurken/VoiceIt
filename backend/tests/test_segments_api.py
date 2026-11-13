@@ -319,6 +319,34 @@ def test_reassign_character(client, seeded):
     assert r.json()["character_id"] == other_character_id
 
 
+def test_review_confirmation_preserves_audio_and_analysis_evidence(client, seeded, engine_and_session):
+    segment_id = seeded["generated_seg_id"]
+    with engine_and_session[1]() as db:
+        segment = db.get(BookSegment, segment_id)
+        segment.flagged = True
+        segment.analysis_metadata = {"warnings": ["请核对这句对白的角色"], "source_chunk": 3}
+        db.commit()
+    response = client.patch(f"/segments/{segment_id}", json={"flagged": False})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["flagged"] is False
+    assert result["audio"]["status"] == "completed"
+    assert result["analysis_metadata"]["source_chunk"] == 3
+    assert result["analysis_metadata"]["warnings"] == ["请核对这句对白的角色"]
+
+
+def test_legacy_stage_rename_keeps_existing_audio(client, seeded, engine_and_session):
+    segment_id = seeded["generated_seg_id"]
+    with engine_and_session[1]() as db:
+        segment = db.get(BookSegment, segment_id)
+        segment.voice_stage = "成年"
+        db.commit()
+    response = client.patch(f"/segments/{segment_id}", json={"voice_stage": "青年"})
+    assert response.status_code == 200
+    assert response.json()["voice_stage"] == "青年"
+    assert response.json()["audio"]["status"] == "completed"
+
+
 def test_change_emotion(client, seeded):
     """PATCH /segments/{sid} with emotion and emotion_intensity updates them."""
     segment_id = seeded["narration_seg_id"]
@@ -451,3 +479,14 @@ def test_reassign_segment_to_character_from_different_book_400(client, seeded):
     assert r.status_code == 400, (
         f"Expected 400 for cross-book character assignment, got {r.status_code}: {r.text}"
     )
+
+
+def test_voice_age_stage_is_editable_clearable_and_invalidates_audio(client, seeded):
+    segment_id = seeded["generated_seg_id"]
+    response = client.patch(f"/segments/{segment_id}", json={"voice_stage": "少年"})
+    assert response.status_code == 200
+    assert response.json()["voice_stage"] == "少年"
+    assert response.json()["audio"]["status"] == "stale"
+    response = client.patch(f"/segments/{segment_id}", json={"voice_stage": None})
+    assert response.status_code == 200
+    assert response.json()["voice_stage"] is None

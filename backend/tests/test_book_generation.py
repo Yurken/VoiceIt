@@ -28,6 +28,8 @@ pytestmark = pytest.mark.filterwarnings(
     "ignore::RuntimeWarning:asyncio",
     "ignore:coroutine.*was never awaited:RuntimeWarning",
 )
+
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -98,7 +100,7 @@ def _make_enqueue_mock(TestSession):
         finally:
             db.close()
 
-    def _run_with_test_db(gen_id, coro):
+    def _run_with_test_db(gen_id, coro, **queue_options):
         import backend.database as _db_module
         from backend.services.book_generation import _per_generation_completion_hook
 
@@ -1054,3 +1056,47 @@ def test_story_items_non_overlapping_after_book_generate(
             )
     finally:
         db.close()
+
+def test_selected_chapters_do_not_enqueue_other_chapters(client, analyzed_book, engine_and_session):
+    _, sessions = engine_and_session
+    with sessions() as db:
+        chapter = Chapter(id=str(uuid.uuid4()), book_id=analyzed_book["book_id"], number=2, raw_text="她说：你好。")
+        db.add(chapter)
+        db.flush()
+        segment = BookSegment(chapter_id=chapter.id, character_id=analyzed_book["char_id"], order=0, type="dialogue", text="你好。")
+        db.add(segment)
+        db.commit()
+        second_id = chapter.id
+    result = client.post(f"/books/{analyzed_book['book_id']}/generate", json={"chapter_ids": [second_id], "concurrency": 2})
+    assert result.status_code == 202, result.text
+    assert result.json()["queued_segments"] == 1
+    with sessions() as db:
+        assert all(segment.generation_id is None for segment in db.query(BookSegment).filter_by(chapter_id=analyzed_book["chapter_id"]))
+        assert db.query(BookSegment).filter_by(chapter_id=second_id).one().generation_id
+
+
+def test_invalid_chapter_selection_does_not_leave_book_generating(client, analyzed_book, engine_and_session):
+    result = client.post(f"/books/{analyzed_book['book_id']}/generate", json={"chapter_ids": ["other-book-chapter"]})
+    assert result.status_code == 400
+    with engine_and_session[1]() as db:
+        assert db.get(Book, analyzed_book["book_id"]).status == "analyzed"
+
+
+def test_materialization_preserves_chinese_and_stable_role_seed(analyzed_book, engine_and_session):
+    from backend.services.book_generation import generate_chapter, stable_voice_seed
+    with engine_and_session[1]() as db:
+        profile = db.get(VoiceProfile, analyzed_book["profile_id"])
+        profile.preset_engine = profile.default_engine = "qwen_custom_voice"
+        profile.preset_voice_id = "Vivian"
+        for segment in db.query(BookSegment).filter_by(chapter_id=analyzed_book["chapter_id"]):
+            segment.text = "这是同一个角色的中文台词。"
+            segment.voice_stage = "老年"
+        db.commit()
+        count, ids = generate_chapter(analyzed_book["chapter_id"], db=db)
+        assert count == 2
+        for generation in db.query(Generation).filter(Generation.id.in_(ids)):
+            assert generation.language == "zh"
+            assert generation.engine == "qwen_custom_voice"
+            assert generation.model_size == "1.7B"
+            assert generation.seed == stable_voice_seed(profile.id)
+            assert "老年" in generation.instruct
